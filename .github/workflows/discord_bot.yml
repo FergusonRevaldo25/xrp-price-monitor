@@ -11,11 +11,14 @@ jobs:
     timeout-minutes: 230
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - run: pip install requests
+
       - name: Run ticker
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python xrpprice.py
+        run: python -u xrpprice.py
