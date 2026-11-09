@@ -2,25 +2,20 @@ name: Live 1-Minute XRP Ticker
 
 on:
   schedule:
-    - cron: "0 */4 * * *" # Restarts the loop environment safely every 4 hours
-  workflow_dispatch: # Lets you run it manually anytime
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
 
 jobs:
   live-tracker:
     runs-on: ubuntu-latest
+    timeout-minutes: 230
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
-
-      - name: Install Dependencies
-        run: pip install requests
-
-      - name: Run Ticker Script
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Run ticker
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python xrpprice.py
