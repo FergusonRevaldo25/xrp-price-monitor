@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -8,18 +9,45 @@ import requests
 
 # ===== SETTINGS =====
 HARDCODED_WEBHOOK = "https://discord.com/api/webhooks/1564239707515260938/MdCL16AZn4Yfydf6iWyFr0FAr-26ldTtLwotiM6YhShtWpa-1tQGtZZh7NmFjGgHlUCf"   # keep your existing one here
-DISCORD_USER_ID = ""        # optional: paste your Discord user ID to get @mentioned
-BUY_LEVEL_ZAR = 21.50       # alert when price crosses this level (in rand)
-ALERT_DIRECTION = "above"   # "above" = alert when price rises to the level, "below" = when it falls to it
-PCT_MOVE_ALERT = 3.0        # also alert on a move of this % within 1 hour (set 0 to turn off)
-NEWS_CHECK_EVERY = 5        # check news every 5 minutes
+DISCORD_USER_ID = ""        # keep your Discord user ID here
+BUY_LEVEL_ZAR = 21.50
+ALERT_DIRECTION = "above"   # "above" or "below"
+PCT_MOVE_ALERT = 3.0        # % move within 1 hour (0 = off)
+NEWS_CHECK_EVERY = 5        # minutes
 
+# mode "sec"    = only if headline mentions Ripple/XRP
+# mode "ripple" = official Ripple posts, always send
+# mode "news"   = must mention Ripple/XRP AND come from a trusted outlet
 NEWS_FEEDS = {
-    "SEC": "https://www.sec.gov/news/pressreleases.rss",
-    "Ripple": "https://ripple.com/insights/feed/",
-    "XRP News": "https://news.google.com/rss/search?q=Ripple+XRP+SEC+when:1d&hl=en-US&gl=US&ceid=US:en",
+    "SEC": {"url": "https://www.sec.gov/news/pressreleases.rss", "mode": "sec"},
+    "Ripple": {"url": "https://ripple.com/insights/feed/", "mode": "ripple"},
+    "XRP News": {
+        "url": "https://news.google.com/rss/search?q=XRP+OR+%22Ripple+Labs%22+when:1d&hl=en-US&gl=US&ceid=US:en",
+        "mode": "news",
+    },
 }
+
+TRUSTED_SOURCES = [
+    "reuters", "bloomberg", "coindesk", "the block", "cointelegraph", "decrypt",
+    "cnbc", "wall street journal", "wsj", "financial times", "forbes", "fortune",
+    "yahoo finance", "marketwatch", "barron", "ripple", "sec.gov", "securities and exchange",
+]
+
+BLOCK_WORDS = [
+    "price prediction", "price forecast", "predicts", "prediction", "could hit", "will hit",
+    "to the moon", "giveaway", "airdrop", "presale", "pre-sale", "100x", "1000x", "next bitcoin",
+    "best crypto to buy", "top 5", "top 10", "meme coin", "memecoin", "buy now", "millionaire",
+    "sponsored", "advertorial", "get rich", "passive income", "price analysis",
+]
+
+PRIORITY_WORDS = [
+    "approved", "approval", "approves", "lawsuit", "ruling", "court", "etf", "settlement",
+    "license", "licence", "acquisition", "acquires", "partnership", "delist", "hack",
+    "breach", "injunction", "appeal", "dismiss", "charges", "launch",
+]
 # ====================
+
+RELEVANT_RE = re.compile(r"\bxrp\b|\bripple\b|garlinghouse|rlusd", re.I)
 
 WEBHOOK = (os.getenv("DISCORD_WEBHOOK_URL") or "").strip()
 if not WEBHOOK and HARDCODED_WEBHOOK.startswith("https://"):
@@ -85,6 +113,7 @@ def send_alert(text):
 
 
 def fetch_feed(url):
+    """Returns a list of (title, link, source)."""
     r = requests.get(url, headers=HEADERS, timeout=15)
     r.raise_for_status()
     root = ET.fromstring(r.content)
@@ -92,8 +121,9 @@ def fetch_feed(url):
     for it in root.iter("item"):  # RSS
         title = (it.findtext("title") or "").strip()
         link = (it.findtext("link") or "").strip()
+        source = (it.findtext("source") or "").strip()
         if title and link:
-            items.append((title, link))
+            items.append((title, link, source))
     if not items:  # Atom fallback
         ns = "{http://www.w3.org/2005/Atom}"
         for e in root.iter(f"{ns}entry"):
@@ -101,26 +131,72 @@ def fetch_feed(url):
             l = e.find(f"{ns}link")
             link = l.get("href") if l is not None else ""
             if title and link:
-                items.append((title, link))
+                items.append((title, link, ""))
     return items
 
 
-def check_news(seen, initialized):
-    for name, url in NEWS_FEEDS.items():
+def is_relevant(title):
+    t = title.lower()
+    return bool(RELEVANT_RE.search(title)) and "ripple effect" not in t
+
+
+def is_blocked(title):
+    t = title.lower()
+    return any(b in t for b in BLOCK_WORDS)
+
+
+def is_trusted(title, source):
+    text = f"{source} {title}".lower()
+    return any(s in text for s in TRUSTED_SOURCES)
+
+
+def is_priority(title):
+    t = title.lower()
+    return any(p in t for p in PRIORITY_WORDS)
+
+
+def passes_filters(mode, title, source):
+    if mode == "ripple":
+        return True
+    if not is_relevant(title) or is_blocked(title):
+        return False
+    if mode == "news":
+        return is_trusted(title, source)
+    return True  # sec: relevant to Ripple/XRP is enough
+
+
+def check_news(seen_links, seen_titles, initialized):
+    for name, cfg in NEWS_FEEDS.items():
         try:
-            items = fetch_feed(url)
+            items = fetch_feed(cfg["url"])
         except Exception as e:
             log(f"News feed '{name}' failed: {e}")
             continue
-        new = [(t, l) for t, l in items if l not in seen[name]]
-        for t, l in items:
-            seen[name].add(l)
+
+        new = []
+        for title, link, source in items:
+            key = re.sub(r"\W+", " ", title.lower()).strip()
+            if link in seen_links[name] or key in seen_titles:
+                seen_links[name].add(link)
+                continue
+            seen_links[name].add(link)
+            seen_titles.add(key)
+            new.append((title, link, source))
+
         if not initialized[name]:
             initialized[name] = True  # first load: remember existing items, don't flood the channel
             log(f"News feed '{name}' ready ({len(items)} items)")
             continue
-        for t, l in new[:5]:
-            send_alert(f"📰 **{name}**: {t}\n{l}")
+
+        sent = 0
+        for title, link, source in new:
+            if not passes_filters(cfg["mode"], title, source):
+                continue
+            tag = "🚨 " if is_priority(title) else ""
+            send_alert(f"{tag}📰 **{name}**: {title}\n{link}")
+            sent += 1
+            if sent >= 5:
+                break
 
 
 def main():
@@ -130,19 +206,19 @@ def main():
 
     log(f"Webhook found (length {len(WEBHOOK)}). Starting ticker loop...")
     message_id = None
-    history = deque(maxlen=61)   # about 1 hour of 1-minute prices
-    prev_state = None            # whether price was past the buy level last cycle
+    history = deque(maxlen=61)
+    prev_state = None
     last_move_alert = 0
-    seen = {n: set() for n in NEWS_FEEDS}
+    seen_links = {n: set() for n in NEWS_FEEDS}
+    seen_titles = set()
     initialized = {n: False for n in NEWS_FEEDS}
 
-    for i in range(210):  # about 3.5 hours, then exit so the next scheduled run takes over
+    for i in range(210):  # about 3.5 hours
         data = get_prices()
         if data:
             price_usd, mcap_usd, usd_to_zar = data
             price_zar = price_usd * usd_to_zar
 
-            # ---- live embed (edited quietly) ----
             payload = build_payload(price_usd, mcap_usd, usd_to_zar)
             try:
                 if message_id is None:
@@ -164,20 +240,14 @@ def main():
             except Exception as e:
                 log(f"Discord error: {e}")
 
-            # ---- buy-level alert (fires once per crossing) ----
-            if ALERT_DIRECTION == "below":
-                reached = price_zar <= BUY_LEVEL_ZAR
-            else:
-                reached = price_zar >= BUY_LEVEL_ZAR
+            reached = price_zar <= BUY_LEVEL_ZAR if ALERT_DIRECTION == "below" else price_zar >= BUY_LEVEL_ZAR
             if prev_state is False and reached:
                 send_alert(
-                    f"🚨 **XRP hit your level!** R {price_zar:,.2f} "
-                    f"(${price_usd:,.4f}) is {ALERT_DIRECTION} R {BUY_LEVEL_ZAR:.2f}. "
-                    f"Check your checklist before buying on Luno."
+                    f"🚨 **XRP hit your level!** R {price_zar:,.2f} (${price_usd:,.4f}) "
+                    f"is {ALERT_DIRECTION} R {BUY_LEVEL_ZAR:.2f}. Check your checklist before buying on Luno."
                 )
             prev_state = reached
 
-            # ---- fast-move alert ----
             history.append(price_usd)
             if PCT_MOVE_ALERT > 0 and len(history) == history.maxlen:
                 change = (price_usd - history[0]) / history[0] * 100
@@ -186,9 +256,8 @@ def main():
                     send_alert(f"{arrow} XRP moved {change:+.1f}% in the last hour: R {price_zar:,.2f} (${price_usd:,.4f})")
                     last_move_alert = time.time()
 
-        # ---- news ----
         if i % NEWS_CHECK_EVERY == 0:
-            check_news(seen, initialized)
+            check_news(seen_links, seen_titles, initialized)
 
         time.sleep(60)
 
