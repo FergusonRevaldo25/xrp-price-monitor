@@ -8,8 +8,8 @@ from collections import deque
 import requests
 
 # ===== SETTINGS =====
-HARDCODED_WEBHOOK = "https://discord.com/api/webhooks/1564239707515260938/MdCL16AZn4Yfydf6iWyFr0FAr-26ldTtLwotiM6YhShtWpa-1tQGtZZh7NmFjGgHlUCf"   # keep your existing one here
-DISCORD_USER_ID = ""        # keep your Discord user ID here
+HARDCODED_WEBHOOK = "https://discord.com/api/webhooks/1564239707515260938/MdCL16AZn4Yfydf6iWyFr0FAr-26ldTtLwotiM6YhShtWpa-1tQGtZZh7NmFjGgHlUCf"   # paste your webhook here
+DISCORD_USER_ID = ""        # paste your Discord user ID here
 BUY_LEVEL_ZAR = 21.50
 ALERT_DIRECTION = "above"   # "above" or "below"
 PCT_MOVE_ALERT = 3.0        # % move within 1 hour (0 = off)
@@ -23,6 +23,14 @@ NEWS_FEEDS = {
     "Ripple": {"url": "https://ripple.com/insights/feed/", "mode": "ripple"},
     "XRP News": {
         "url": "https://news.google.com/rss/search?q=XRP+OR+%22Ripple+Labs%22+when:1d&hl=en-US&gl=US&ceid=US:en",
+        "mode": "news",
+    },
+    "XRP ETF": {
+        "url": "https://news.google.com/rss/search?q=XRP+ETF+inflows+OR+approval+when:3d&hl=en-US&gl=US&ceid=US:en",
+        "mode": "news",
+    },
+    "Ripple Deals": {
+        "url": "https://news.google.com/rss/search?q=Ripple+partnership+OR+RLUSD+OR+%22Ripple+Prime%22+OR+licence+when:3d&hl=en-US&gl=US&ceid=US:en",
         "mode": "news",
     },
 }
@@ -44,6 +52,19 @@ PRIORITY_WORDS = [
     "approved", "approval", "approves", "lawsuit", "ruling", "court", "etf", "settlement",
     "license", "licence", "acquisition", "acquires", "partnership", "delist", "hack",
     "breach", "injunction", "appeal", "dismiss", "charges", "launch",
+]
+
+BULLISH_WORDS = [
+    "inflow", "inflows", "approved", "approval", "approves", "launch", "launches", "partnership",
+    "partners with", "adopts", "adoption", "licence", "license", "acquires", "acquisition",
+    "dismissed", "dismisses", "wins", "settles", "clarity", "record", "surge", "integrates",
+    "rlusd", "etf", "bank",
+]
+
+BEARISH_WORDS = [
+    "outflow", "outflows", "lawsuit", "sues", "sued", "rejected", "rejects", "delay", "delays",
+    "hack", "hacked", "breach", "fraud", "investigation", "ban", "bans", "crash", "plunge",
+    "dump", "sell-off", "selloff", "fine", "fined", "charges",
 ]
 # ====================
 
@@ -155,6 +176,17 @@ def is_priority(title):
     return any(p in t for p in PRIORITY_WORDS)
 
 
+def sentiment(title):
+    t = title.lower()
+    bull = any(w in t for w in BULLISH_WORDS)
+    bear = any(w in t for w in BEARISH_WORDS)
+    if bull and not bear:
+        return "🟢 Bullish"
+    if bear and not bull:
+        return "🔴 Bearish"
+    return "⚪ Check"
+
+
 def passes_filters(mode, title, source):
     if mode == "ripple":
         return True
@@ -193,7 +225,7 @@ def check_news(seen_links, seen_titles, initialized):
             if not passes_filters(cfg["mode"], title, source):
                 continue
             tag = "🚨 " if is_priority(title) else ""
-            send_alert(f"{tag}📰 **{name}**: {title}\n{link}")
+            send_alert(f"{tag}{sentiment(title)} 📰 **{name}**: {title}\n{link}")
             sent += 1
             if sent >= 5:
                 break
