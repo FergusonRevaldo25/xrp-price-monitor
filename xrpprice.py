@@ -189,6 +189,15 @@ def get_prices(state):
         return None, False
 
 
+def short_num(n, prefix=""):
+    """Format a big number with a letter: K thousand, M million, B billion, T trillion, Q quadrillion."""
+    n = float(n)
+    for limit, letter in ((1e15, "Q"), (1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(n) >= limit:
+            return f"{prefix}{n / limit:,.2f}{letter}"
+    return f"{prefix}{n:,.2f}"
+
+
 def build_payload(d):
     updated = time.strftime("%H:%M", time.gmtime(d["time"]))
     return {
@@ -200,8 +209,8 @@ def build_payload(d):
                 {"name": "💵 Price (USD)", "value": f"${d['price_usd']:,.4f}", "inline": True},
                 {"name": "🇿🇦 Price (ZAR)", "value": f"R {d['price_zar']:,.2f}", "inline": True},
                 {"name": "\u200b", "value": "\u200b", "inline": False},
-                {"name": "📈 Market Cap (USD)", "value": f"${d['mcap_usd']:,.0f}", "inline": True},
-                {"name": "🇿🇦 Market Cap (ZAR)", "value": f"R {d['mcap_zar']:,.0f}", "inline": True},
+                {"name": "📈 Market Cap (USD)", "value": short_num(d["mcap_usd"], "$"), "inline": True},
+                {"name": "🇿🇦 Market Cap (ZAR)", "value": short_num(d["mcap_zar"], "R "), "inline": True},
             ],
             "footer": {"text": f"{d['source']} · price as of {updated} UTC · buy alert R {BUY_LEVEL_ZAR:.2f}"},
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
