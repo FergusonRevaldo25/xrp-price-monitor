@@ -22,7 +22,7 @@ ALERT_DIRECTION = "above"   # "above" or "below"
 PCT_MOVE_ALERT = 3.0        # % move within 1 hour (0 = off)
 CMC_EVERY_MINUTES = 10      # how often to ask CoinMarketCap (free plan has a monthly limit)
 NEWS_CHECK_EVERY = 5        # minutes
-SEND_MIXED = True           # False = only send clearly good or bad news
+SEND_MIXED = True           # False = drops all 🟡 alerts (mixed AND Ripple-growth news)
 # ====================
 
 CMC_URL = "https://pro-api.coinmarketcap.com/v2/cryptocurrency/quotes/latest"
@@ -83,6 +83,14 @@ BEARISH = {
     "crash": 2, "plunge": 2, "plunges": 2, "sell-off": 1, "selloff": 1, "dump": 1, "delist": 3,
     "bearish": 1, "warns": 1, "concern": 1, "uncertainty": 1,
 }
+
+# Signs that a story directly creates demand for XRP itself (not just Ripple's business)
+DIRECT_XRP_WORDS = [
+    "etf inflow", "etf inflows", "spot xrp etf", "xrp etf", "xrp treasury", "xrp reserve",
+    "xrp holdings", "buys xrp", "buying xrp", "purchase of xrp", "on-demand liquidity", "odl",
+    "xrp bridge", "xrp payments", "xrp-based", "uses xrp", "using xrp", "lists xrp",
+    "xrp listing", "xrp as a bridge", "xrp adoption",
+]
 
 RELEVANT_RE = re.compile(r"\bxrp\b|\bripple\b|garlinghouse|rlusd", re.I)
 
@@ -347,8 +355,15 @@ def analyse(title, text):
 
     headline_only = not relevant
     threshold = 2 if headline_only else 3
+
+    blob = (title + " " + " ".join(relevant[:15])).lower()
+    direct_xrp = any(w in blob for w in DIRECT_XRP_WORDS)
+
     if score >= threshold:
-        verdict = "🟢 GOOD NEWS"
+        if direct_xrp:
+            verdict = "🟢 GOOD FOR XRP"
+        else:
+            verdict = "🟡 RIPPLE GROWTH (indirect for XRP)"
     elif score <= -threshold:
         verdict = "🔴 BAD NEWS"
     else:
