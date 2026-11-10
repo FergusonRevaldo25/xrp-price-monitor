@@ -6,6 +6,12 @@ import xml.etree.ElementTree as ET
 from collections import deque
 
 import requests
+from bs4 import BeautifulSoup
+
+try:
+    from googlenewsdecoder import gnewsdecoder
+except Exception:
+    gnewsdecoder = None
 
 # ===== SETTINGS =====
 HARDCODED_WEBHOOK = "https://discord.com/api/webhooks/1564239707515260938/MdCL16AZn4Yfydf6iWyFr0FAr-26ldTtLwotiM6YhShtWpa-1tQGtZZh7NmFjGgHlUCf"   # paste your webhook here
@@ -14,10 +20,9 @@ BUY_LEVEL_ZAR = 21.50
 ALERT_DIRECTION = "above"   # "above" or "below"
 PCT_MOVE_ALERT = 3.0        # % move within 1 hour (0 = off)
 NEWS_CHECK_EVERY = 5        # minutes
+SEND_MIXED = True           # False = only send clearly good or bad news
+# ====================
 
-# mode "sec"    = only if headline mentions Ripple/XRP
-# mode "ripple" = official Ripple posts, always send
-# mode "news"   = must mention Ripple/XRP AND come from a trusted outlet
 NEWS_FEEDS = {
     "SEC": {"url": "https://www.sec.gov/news/pressreleases.rss", "mode": "sec"},
     "Ripple": {"url": "https://ripple.com/insights/feed/", "mode": "ripple"},
@@ -54,19 +59,22 @@ PRIORITY_WORDS = [
     "breach", "injunction", "appeal", "dismiss", "charges", "launch",
 ]
 
-BULLISH_WORDS = [
-    "inflow", "inflows", "approved", "approval", "approves", "launch", "launches", "partnership",
-    "partners with", "adopts", "adoption", "licence", "license", "acquires", "acquisition",
-    "dismissed", "dismisses", "wins", "settles", "clarity", "record", "surge", "integrates",
-    "rlusd", "etf", "bank",
-]
-
-BEARISH_WORDS = [
-    "outflow", "outflows", "lawsuit", "sues", "sued", "rejected", "rejects", "delay", "delays",
-    "hack", "hacked", "breach", "fraud", "investigation", "ban", "bans", "crash", "plunge",
-    "dump", "sell-off", "selloff", "fine", "fined", "charges",
-]
-# ====================
+# phrase: weight (2 = strong signal, 1 = mild signal)
+BULLISH = {
+    "net inflow": 2, "inflows": 2, "etf approved": 3, "approves": 2, "approved": 2, "approval": 1,
+    "drops lawsuit": 3, "dismissed": 2, "dismisses": 2, "drops appeal": 3, "wins": 2, "settles": 2,
+    "partnership": 2, "partners with": 2, "adopts": 2, "adoption": 1, "integrates": 2,
+    "licence granted": 3, "license granted": 3, "granted a licence": 3, "granted a license": 3,
+    "regulatory clarity": 2, "launches": 1, "launch": 1, "acquires": 2, "acquisition": 1,
+    "record high": 2, "all-time high": 2, "surge": 1, "rallies": 1, "rlusd": 1, "bullish": 1,
+}
+BEARISH = {
+    "net outflow": 2, "outflows": 2, "rejected": 2, "rejects": 2, "delays": 2, "delayed": 2,
+    "hack": 3, "hacked": 3, "breach": 3, "exploit": 2, "sues": 2, "sued": 2, "lawsuit filed": 2,
+    "fraud": 3, "investigation": 2, "fined": 2, "fine": 1, "charges": 2, "ban": 2, "bans": 2,
+    "crash": 2, "plunge": 2, "plunges": 2, "sell-off": 1, "selloff": 1, "dump": 1, "delist": 3,
+    "bearish": 1, "warns": 1, "concern": 1, "uncertainty": 1,
+}
 
 RELEVANT_RE = re.compile(r"\bxrp\b|\bripple\b|garlinghouse|rlusd", re.I)
 
@@ -75,12 +83,19 @@ if not WEBHOOK and HARDCODED_WEBHOOK.startswith("https://"):
     WEBHOOK = HARDCODED_WEBHOOK.strip()
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (xrp-price-monitor; personal use)"}
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 def log(*args):
     print(*args, flush=True)
 
 
+# ---------- prices ----------
 def get_prices():
     try:
         r = requests.get("https://api.coinlore.net/api/ticker/?id=58", headers=HEADERS, timeout=10)
@@ -122,7 +137,7 @@ def send_alert(text):
     mention = f"<@{DISCORD_USER_ID}> " if DISCORD_USER_ID else ""
     payload = {
         "username": "XRP Alerts",
-        "content": f"{mention}{text}",
+        "content": f"{mention}{text}"[:1990],
         "allowed_mentions": {"users": [DISCORD_USER_ID]} if DISCORD_USER_ID else {"parse": []},
     }
     try:
@@ -133,6 +148,7 @@ def send_alert(text):
         log(f"Alert error: {e}")
 
 
+# ---------- news fetching ----------
 def fetch_feed(url):
     """Returns a list of (title, link, source)."""
     r = requests.get(url, headers=HEADERS, timeout=15)
@@ -156,9 +172,38 @@ def fetch_feed(url):
     return items
 
 
+def resolve_url(link):
+    """Google News links are redirects; decode them to the real article URL."""
+    if "news.google.com" in link and gnewsdecoder:
+        try:
+            res = gnewsdecoder(link, interval=1)
+            if res.get("status") and res.get("decoded_url"):
+                return res["decoded_url"]
+        except Exception as e:
+            log(f"Could not decode Google link: {e}")
+    return link
+
+
+def fetch_article_text(url):
+    """Returns the article's paragraph text, or '' if it can't be read (paywall, block, error)."""
+    try:
+        r = requests.get(url, headers=BROWSER_HEADERS, timeout=12)
+        if r.status_code != 200 or "html" not in r.headers.get("Content-Type", ""):
+            return ""
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
+            tag.decompose()
+        paras = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+        text = " ".join(p for p in paras if len(p) > 40)
+        return text[:10000]
+    except Exception as e:
+        log(f"Article fetch failed: {e}")
+        return ""
+
+
+# ---------- filters ----------
 def is_relevant(title):
-    t = title.lower()
-    return bool(RELEVANT_RE.search(title)) and "ripple effect" not in t
+    return bool(RELEVANT_RE.search(title)) and "ripple effect" not in title.lower()
 
 
 def is_blocked(title):
@@ -176,17 +221,6 @@ def is_priority(title):
     return any(p in t for p in PRIORITY_WORDS)
 
 
-def sentiment(title):
-    t = title.lower()
-    bull = any(w in t for w in BULLISH_WORDS)
-    bear = any(w in t for w in BEARISH_WORDS)
-    if bull and not bear:
-        return "🟢 Bullish"
-    if bear and not bull:
-        return "🔴 Bearish"
-    return "⚪ Check"
-
-
 def passes_filters(mode, title, source):
     if mode == "ripple":
         return True
@@ -195,6 +229,49 @@ def passes_filters(mode, title, source):
     if mode == "news":
         return is_trusted(title, source)
     return True  # sec: relevant to Ripple/XRP is enough
+
+
+# ---------- analysis ----------
+def split_sentences(text):
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if 30 < len(s.strip()) < 600]
+
+
+def analyse(title, text):
+    """Returns (score, verdict, key_sentence, basis)."""
+    article_sentences = split_sentences(text) if text else []
+    relevant = [s for s in article_sentences if RELEVANT_RE.search(s)][:40]
+    sentences = [title, title] + relevant  # headline counts double
+
+    score = 0
+    best = (0, "")
+    for s in sentences:
+        low = s.lower()
+        s_score = 0
+        for phrase, w in BULLISH.items():
+            if phrase in low:
+                s_score += w
+        for phrase, w in BEARISH.items():
+            if phrase in low:
+                s_score -= w
+        s_score = max(-3, min(3, s_score))  # cap per sentence
+        score += s_score
+        if abs(s_score) > best[0] and s != title:
+            best = (abs(s_score), s)
+
+    headline_only = not relevant
+    threshold = 2 if headline_only else 3
+    if score >= threshold:
+        verdict = "🟢 GOOD NEWS"
+    elif score <= -threshold:
+        verdict = "🔴 BAD NEWS"
+    else:
+        verdict = "🟡 MIXED / NEUTRAL"
+
+    key = best[1] or (relevant[0] if relevant else "")
+    if len(key) > 220:
+        key = key[:217].rstrip() + "..."
+    basis = "headline only" if headline_only else "read full article"
+    return score, verdict, key, basis
 
 
 def check_news(seen_links, seen_titles, initialized):
@@ -224,13 +301,30 @@ def check_news(seen_links, seen_titles, initialized):
         for title, link, source in new:
             if not passes_filters(cfg["mode"], title, source):
                 continue
+
+            url = resolve_url(link)
+            text = fetch_article_text(url)
+            score, verdict, key, basis = analyse(title, text)
+
+            if verdict.startswith("🟡") and not SEND_MIXED:
+                continue
+
             tag = "🚨 " if is_priority(title) else ""
-            send_alert(f"{tag}{sentiment(title)} 📰 **{name}**: {title}\n{link}")
+            src = f" ({source})" if source else ""
+            lines = [f"{tag}{verdict} · {name}{src}", f"**{title}**"]
+            if key:
+                lines.append(f"> {key}")
+            lines.append(f"*Score {score:+d} · {basis}*")
+            lines.append(f"<{url}>")
+            send_alert("\n".join(lines))
+            log(f"News alert sent: {verdict} {title[:60]}")
+
             sent += 1
             if sent >= 5:
                 break
 
 
+# ---------- main loop ----------
 def main():
     if not WEBHOOK:
         log("ERROR: no webhook found. Set the DISCORD_WEBHOOK_URL secret or paste it into HARDCODED_WEBHOOK.")
