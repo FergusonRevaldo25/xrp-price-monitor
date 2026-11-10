@@ -15,13 +15,18 @@ except Exception:
 
 # ===== SETTINGS =====
 HARDCODED_WEBHOOK = "https://discord.com/api/webhooks/1564239707515260938/MdCL16AZn4Yfydf6iWyFr0FAr-26ldTtLwotiM6YhShtWpa-1tQGtZZh7NmFjGgHlUCf"   # paste your webhook here
+HARDCODED_CMC_KEY = ""      # optional: prefer the CMC_API_KEY GitHub secret instead
 DISCORD_USER_ID = ""        # paste your Discord user ID here
 BUY_LEVEL_ZAR = 21.50
 ALERT_DIRECTION = "above"   # "above" or "below"
 PCT_MOVE_ALERT = 3.0        # % move within 1 hour (0 = off)
+CMC_EVERY_MINUTES = 10      # how often to ask CoinMarketCap (free plan has a monthly limit)
 NEWS_CHECK_EVERY = 5        # minutes
 SEND_MIXED = True           # False = only send clearly good or bad news
 # ====================
+
+CMC_URL = "https://pro-api.coinmarketcap.com/v2/cryptocurrency/quotes/latest"
+CMC_XRP_ID = "52"
 
 NEWS_FEEDS = {
     "SEC": {"url": "https://www.sec.gov/news/pressreleases.rss", "mode": "sec"},
@@ -59,7 +64,6 @@ PRIORITY_WORDS = [
     "breach", "injunction", "appeal", "dismiss", "charges", "launch",
 ]
 
-# phrase: weight (2 = strong signal, 1 = mild signal)
 BULLISH = {
     "net inflow": 2, "inflows": 2, "etf approved": 3, "approves": 2, "approved": 2, "approval": 1,
     "drops lawsuit": 3, "dismissed": 2, "dismisses": 2, "drops appeal": 3, "wins": 2, "settles": 2,
@@ -82,6 +86,8 @@ WEBHOOK = (os.getenv("DISCORD_WEBHOOK_URL") or "").strip()
 if not WEBHOOK and HARDCODED_WEBHOOK.startswith("https://"):
     WEBHOOK = HARDCODED_WEBHOOK.strip()
 
+CMC_KEY = (os.getenv("CMC_API_KEY") or "").strip() or HARDCODED_CMC_KEY.strip()
+
 HEADERS = {"User-Agent": "Mozilla/5.0 (xrp-price-monitor; personal use)"}
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -96,38 +102,94 @@ def log(*args):
 
 
 # ---------- prices ----------
-def get_prices():
-    try:
-        r = requests.get("https://api.coinlore.net/api/ticker/?id=58", headers=HEADERS, timeout=10)
-        coin = r.json()[0]
-        price_usd = float(coin["price_usd"])
-        mcap_usd = float(coin["market_cap_usd"])
-    except Exception as e:
-        log(f"Crypto fetch fail: {e}")
-        return None
+def fetch_cmc():
+    r = requests.get(
+        CMC_URL,
+        headers={"X-CMC_PRO_API_KEY": CMC_KEY, "Accept": "application/json"},
+        params={"id": CMC_XRP_ID, "convert": "USD,ZAR"},
+        timeout=15,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+    d = r.json()["data"][CMC_XRP_ID]
+    if isinstance(d, list):
+        d = d[0]
+    q = d["quote"]
+    usd, zar = q["USD"], q["ZAR"]
+    return {
+        "price_usd": float(usd["price"]),
+        "price_zar": float(zar["price"]),
+        "mcap_usd": float(usd.get("market_cap") or 0),
+        "mcap_zar": float(zar.get("market_cap") or 0),
+        "usd_to_zar": float(zar["price"]) / float(usd["price"]),
+        "source": "CoinMarketCap",
+    }
+
+
+def fetch_coinlore():
+    r = requests.get("https://api.coinlore.net/api/ticker/?id=58", headers=HEADERS, timeout=10)
+    coin = r.json()[0]
+    price_usd = float(coin["price_usd"])
+    mcap_usd = float(coin["market_cap_usd"])
     try:
         f = requests.get("https://open.er-api.com/v6/latest/USD", headers=HEADERS, timeout=10)
         usd_to_zar = float(f.json()["rates"]["ZAR"])
     except Exception as e:
         log(f"Fiat fetch fail: {e}")
         usd_to_zar = 18.00
-    return price_usd, mcap_usd, usd_to_zar
+    return {
+        "price_usd": price_usd,
+        "price_zar": price_usd * usd_to_zar,
+        "mcap_usd": mcap_usd,
+        "mcap_zar": mcap_usd * usd_to_zar,
+        "usd_to_zar": usd_to_zar,
+        "source": "CoinLore (backup)",
+    }
 
 
-def build_payload(price_usd, mcap_usd, usd_to_zar):
+def get_prices(state):
+    """Returns (data, fresh). CoinMarketCap is polled every CMC_EVERY_MINUTES, CoinLore is the backup."""
+    now = time.time()
+
+    if CMC_KEY and now >= state["next_cmc"]:
+        try:
+            data = fetch_cmc()
+            data["time"] = now
+            state["cmc"] = data
+            state["next_cmc"] = now + CMC_EVERY_MINUTES * 60
+            return data, True
+        except Exception as e:
+            log(f"CoinMarketCap fetch failed: {e}")
+            state["next_cmc"] = now + 120  # retry in 2 minutes
+
+    cmc = state.get("cmc")
+    if cmc and now - cmc["time"] < 30 * 60:
+        return cmc, False  # still fresh enough, reuse
+
+    try:  # backup source
+        data = fetch_coinlore()
+        data["time"] = now
+        return data, True
+    except Exception as e:
+        log(f"CoinLore fetch failed: {e}")
+        return None, False
+
+
+def build_payload(d):
+    updated = time.strftime("%H:%M", time.gmtime(d["time"]))
     return {
         "username": "XRP Live Dashboard",
         "embeds": [{
             "title": "⚡ Live XRP Market Ticker",
             "color": 5763719,
             "fields": [
-                {"name": "💵 Price (USD)", "value": f"${price_usd:,.4f}", "inline": True},
-                {"name": "🇿🇦 Price (ZAR)", "value": f"R {price_usd * usd_to_zar:,.2f}", "inline": True},
+                {"name": "💵 Price (USD)", "value": f"${d['price_usd']:,.4f}", "inline": True},
+                {"name": "🇿🇦 Price (ZAR)", "value": f"R {d['price_zar']:,.2f}", "inline": True},
                 {"name": "\u200b", "value": "\u200b", "inline": False},
-                {"name": "📈 Market Cap (USD)", "value": f"${mcap_usd:,.0f}", "inline": True},
-                {"name": "🇿🇦 Market Cap (ZAR)", "value": f"R {mcap_usd * usd_to_zar:,.0f}", "inline": True},
+                {"name": "📈 Market Cap (USD)", "value": f"${d['mcap_usd']:,.0f}", "inline": True},
+                {"name": "🇿🇦 Market Cap (ZAR)", "value": f"R {d['mcap_zar']:,.0f}", "inline": True},
             ],
-            "footer": {"text": f"Buy alert: R {BUY_LEVEL_ZAR:.2f} | 1 USD = R {usd_to_zar:.2f}"},
+            "footer": {"text": f"{d['source']} · price as of {updated} UTC · buy alert R {BUY_LEVEL_ZAR:.2f}"},
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }],
     }
@@ -330,9 +392,16 @@ def main():
         log("ERROR: no webhook found. Set the DISCORD_WEBHOOK_URL secret or paste it into HARDCODED_WEBHOOK.")
         sys.exit(1)
 
-    log(f"Webhook found (length {len(WEBHOOK)}). Starting ticker loop...")
+    log(f"Webhook found (length {len(WEBHOOK)}).")
+    if CMC_KEY:
+        log(f"CoinMarketCap key found. Polling every {CMC_EVERY_MINUTES} min.")
+    else:
+        log("No CMC_API_KEY found, using CoinLore backup prices only.")
+    log("Starting ticker loop...")
+
+    state = {"next_cmc": 0, "cmc": None}
     message_id = None
-    history = deque(maxlen=61)
+    history = deque()            # (timestamp, price_usd) for the 1-hour move alert
     prev_state = None
     last_move_alert = 0
     seen_links = {n: set() for n in NEWS_FEEDS}
@@ -340,12 +409,12 @@ def main():
     initialized = {n: False for n in NEWS_FEEDS}
 
     for i in range(210):  # about 3.5 hours
-        data = get_prices()
-        if data:
-            price_usd, mcap_usd, usd_to_zar = data
-            price_zar = price_usd * usd_to_zar
+        d, fresh = get_prices(state)
+        if d:
+            price_zar = d["price_zar"]
+            price_usd = d["price_usd"]
 
-            payload = build_payload(price_usd, mcap_usd, usd_to_zar)
+            payload = build_payload(d)
             try:
                 if message_id is None:
                     res = requests.post(f"{WEBHOOK}?wait=true", json=payload, timeout=10)
@@ -362,7 +431,7 @@ def main():
                         log("Discord edit failed:", res.status_code, res.text)
                         message_id = None
                     elif i % 30 == 0:
-                        log(f"Updated OK (cycle {i}) price R{price_zar:.2f}")
+                        log(f"Updated OK (cycle {i}) R{price_zar:.2f} via {d['source']}")
             except Exception as e:
                 log(f"Discord error: {e}")
 
@@ -370,17 +439,22 @@ def main():
             if prev_state is False and reached:
                 send_alert(
                     f"🚨 **XRP hit your level!** R {price_zar:,.2f} (${price_usd:,.4f}) "
-                    f"is {ALERT_DIRECTION} R {BUY_LEVEL_ZAR:.2f}. Check your checklist before buying on Luno."
+                    f"is {ALERT_DIRECTION} R {BUY_LEVEL_ZAR:.2f}. Source: {d['source']}. "
+                    f"Check your checklist before buying on Luno."
                 )
             prev_state = reached
 
-            history.append(price_usd)
-            if PCT_MOVE_ALERT > 0 and len(history) == history.maxlen:
-                change = (price_usd - history[0]) / history[0] * 100
-                if abs(change) >= PCT_MOVE_ALERT and time.time() - last_move_alert > 3600:
-                    arrow = "📈" if change > 0 else "📉"
-                    send_alert(f"{arrow} XRP moved {change:+.1f}% in the last hour: R {price_zar:,.2f} (${price_usd:,.4f})")
-                    last_move_alert = time.time()
+            if fresh:
+                now = time.time()
+                history.append((now, price_usd))
+                while history and now - history[0][0] > 3900:
+                    history.popleft()
+                if PCT_MOVE_ALERT > 0 and history and now - history[0][0] >= 3300:
+                    change = (price_usd - history[0][1]) / history[0][1] * 100
+                    if abs(change) >= PCT_MOVE_ALERT and now - last_move_alert > 3600:
+                        arrow = "📈" if change > 0 else "📉"
+                        send_alert(f"{arrow} XRP moved {change:+.1f}% in the last hour: R {price_zar:,.2f} (${price_usd:,.4f})")
+                        last_move_alert = now
 
         if i % NEWS_CHECK_EVERY == 0:
             check_news(seen_links, seen_titles, initialized)

@@ -21,4 +21,5 @@ jobs:
       - name: Run ticker
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          CMC_API_KEY: ${{ secrets.CMC_API_KEY }}
         run: python -u xrpprice.py
