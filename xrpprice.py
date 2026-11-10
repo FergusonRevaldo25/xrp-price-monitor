@@ -30,7 +30,10 @@ CMC_XRP_ID = "52"
 
 NEWS_FEEDS = {
     "SEC": {"url": "https://www.sec.gov/news/pressreleases.rss", "mode": "sec"},
-    "Ripple": {"url": "https://ripple.com/insights/feed/", "mode": "ripple"},
+    "Ripple": {
+        "url": "https://news.google.com/rss/search?q=site:ripple.com+when:7d&hl=en-US&gl=US&ceid=US:en",
+        "mode": "ripple",
+    },
     "XRP News": {
         "url": "https://news.google.com/rss/search?q=XRP+OR+%22Ripple+Labs%22+when:1d&hl=en-US&gl=US&ceid=US:en",
         "mode": "news",
@@ -56,6 +59,7 @@ BLOCK_WORDS = [
     "to the moon", "giveaway", "airdrop", "presale", "pre-sale", "100x", "1000x", "next bitcoin",
     "best crypto to buy", "top 5", "top 10", "meme coin", "memecoin", "buy now", "millionaire",
     "sponsored", "advertorial", "get rich", "passive income", "price analysis",
+    "live price", "price, news", "price today", "price chart", "converter", "to usd", "to zar",
 ]
 
 PRIORITY_WORDS = [
@@ -102,11 +106,21 @@ def log(*args):
 
 
 # ---------- prices ----------
+def get_usd_to_zar():
+    try:
+        f = requests.get("https://open.er-api.com/v6/latest/USD", headers=HEADERS, timeout=10)
+        return float(f.json()["rates"]["ZAR"])
+    except Exception as e:
+        log(f"Fiat fetch fail: {e}")
+        return 18.00
+
+
 def fetch_cmc():
+    """Free plan allows only ONE convert currency, so ask for ZAR and derive USD from the exchange rate."""
     r = requests.get(
         CMC_URL,
         headers={"X-CMC_PRO_API_KEY": CMC_KEY, "Accept": "application/json"},
-        params={"id": CMC_XRP_ID, "convert": "USD,ZAR"},
+        params={"id": CMC_XRP_ID, "convert": "ZAR"},
         timeout=15,
     )
     if r.status_code != 200:
@@ -114,14 +128,18 @@ def fetch_cmc():
     d = r.json()["data"][CMC_XRP_ID]
     if isinstance(d, list):
         d = d[0]
-    q = d["quote"]
-    usd, zar = q["USD"], q["ZAR"]
+    zar = d["quote"]["ZAR"]
+    price_zar = float(zar["price"])
+    mcap_zar = float(zar.get("market_cap") or 0)
+    if not mcap_zar and d.get("circulating_supply"):
+        mcap_zar = price_zar * float(d["circulating_supply"])
+    usd_to_zar = get_usd_to_zar()
     return {
-        "price_usd": float(usd["price"]),
-        "price_zar": float(zar["price"]),
-        "mcap_usd": float(usd.get("market_cap") or 0),
-        "mcap_zar": float(zar.get("market_cap") or 0),
-        "usd_to_zar": float(zar["price"]) / float(usd["price"]),
+        "price_zar": price_zar,
+        "mcap_zar": mcap_zar,
+        "price_usd": price_zar / usd_to_zar,
+        "mcap_usd": mcap_zar / usd_to_zar,
+        "usd_to_zar": usd_to_zar,
         "source": "CoinMarketCap",
     }
 
@@ -131,12 +149,7 @@ def fetch_coinlore():
     coin = r.json()[0]
     price_usd = float(coin["price_usd"])
     mcap_usd = float(coin["market_cap_usd"])
-    try:
-        f = requests.get("https://open.er-api.com/v6/latest/USD", headers=HEADERS, timeout=10)
-        usd_to_zar = float(f.json()["rates"]["ZAR"])
-    except Exception as e:
-        log(f"Fiat fetch fail: {e}")
-        usd_to_zar = 18.00
+    usd_to_zar = get_usd_to_zar()
     return {
         "price_usd": price_usd,
         "price_zar": price_usd * usd_to_zar,
@@ -157,6 +170,7 @@ def get_prices(state):
             data["time"] = now
             state["cmc"] = data
             state["next_cmc"] = now + CMC_EVERY_MINUTES * 60
+            log(f"CoinMarketCap OK: R{data['price_zar']:.2f}")
             return data, True
         except Exception as e:
             log(f"CoinMarketCap fetch failed: {e}")
@@ -284,9 +298,11 @@ def is_priority(title):
 
 
 def passes_filters(mode, title, source):
+    if is_blocked(title):
+        return False
     if mode == "ripple":
         return True
-    if not is_relevant(title) or is_blocked(title):
+    if not is_relevant(title):
         return False
     if mode == "news":
         return is_trusted(title, source)
