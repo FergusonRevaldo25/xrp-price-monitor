@@ -5,6 +5,7 @@ XRP price and news monitor.
 Price dashboard: one Discord message, edited in place.
 News dashboard: one separate Discord message, edited in place.
 News history: persisted to xrp_state.json between GitHub Actions runs.
+News dashboard includes an attached sentiment timeline and topic breakdown chart.
 """
 
 import json
@@ -18,9 +19,23 @@ import xml.etree.ElementTree as ET
 from collections import deque
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+from io import BytesIO
 
 import requests
 from bs4 import BeautifulSoup
+
+# Matplotlib is used only for the news dashboard image. The price dashboard
+# remains a normal Discord embed and does not depend on chart generation.
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.dates import DateFormatter
+    CHARTS_AVAILABLE = True
+except Exception as chart_import_error:
+    plt = None
+    DateFormatter = None
+    CHARTS_AVAILABLE = False
 
 try:
     from googlenewsdecoder import gnewsdecoder
@@ -421,28 +436,53 @@ def send_alert(message):
         log(f"Alert error: {exc}")
 
 
-def create_or_edit_webhook_message(message_id, payload):
-    """Create once, then edit the same webhook message."""
+def create_or_edit_webhook_message(message_id, payload, files=None):
+    """Create once, then edit the same webhook message, optionally replacing chart files."""
+    request_kwargs = {"timeout": 30}
+    if files:
+        # Discord expects multipart form data when an embed references
+        # attachment:// filenames. IDs 0..N identify the new uploads.
+        payload = dict(payload)
+        payload["attachments"] = [
+            {"id": index, "filename": filename}
+            for index, (filename, content, content_type) in enumerate(files)
+        ]
+        request_kwargs["data"] = {
+            "payload_json": json.dumps(payload, ensure_ascii=False)
+        }
+        request_kwargs["files"] = [
+            (f"files[{index}]", (filename, content, content_type))
+            for index, (filename, content, content_type) in enumerate(files)
+        ]
+    else:
+        request_kwargs["json"] = payload
+
     if message_id:
         response = requests.patch(
-            f"{WEBHOOK}/messages/{message_id}", json=payload, timeout=15
+            f"{WEBHOOK}/messages/{message_id}", **request_kwargs
         )
         if response.status_code in (200, 204):
             return message_id
         log(f"Discord edit failed ({response.status_code}); will recreate.")
         if response.status_code not in (404, 10008):
-            return message_id
+            raise RuntimeError(
+                f"Discord message edit failed: {response.status_code} {response.text[:300]}"
+            )
 
     response = requests.post(
-        f"{WEBHOOK}?wait=true", json=payload, timeout=15
+        f"{WEBHOOK}?wait=true", **request_kwargs
     )
     if response.status_code not in (200, 201):
-        log(f"Discord message create failed: {response.status_code} {response.text[:300]}")
-        return message_id
+        raise RuntimeError(
+            f"Discord message create failed: {response.status_code} {response.text[:300]}"
+        )
     try:
-        return response.json().get("id")
-    except Exception:
-        return message_id
+        new_id = response.json().get("id")
+        if not new_id:
+            raise RuntimeError("Discord created the message but returned no message ID.")
+        return new_id
+    except ValueError as exc:
+        raise RuntimeError("Discord returned an unreadable message response.") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -666,6 +706,7 @@ def record_news(state, feed_name, title, url, source, analysis):
         "url": url,
         "source": source or domain_of(url) or feed_name,
         "feed": feed_name,
+        "category": news_category(title, feed_name),
         "verdict": analysis["verdict"],
         "score": analysis["score"],
         "confidence": analysis["confidence"],
@@ -762,6 +803,132 @@ def process_news(state):
 # EDITABLE NEWS DASHBOARD
 # ---------------------------------------------------------------------------
 
+def news_category(title, feed=""):
+    """Assign each story to one display category using transparent keyword rules."""
+    text = f"{title} {feed}".lower()
+    rules = (
+        ("ETF / Funds", ("etf", "exchange-traded", "fund inflow", "fund outflow")),
+        ("Regulation", ("sec", "court", "lawsuit", "regulat", "license", "licence", "ruling")),
+        ("Ripple business", ("ripple", "partnership", "partner", "acquisition", "rlusd", "prime")),
+        ("Adoption / Payments", ("adoption", "payment", "on-demand liquidity", "odl", "bank", "remittance")),
+        ("Security", ("hack", "hacked", "exploit", "breach", "fraud", "scam")),
+    )
+    for category, terms in rules:
+        if any(term in text for term in terms):
+            return category
+    return "Other XRP news"
+
+
+def build_news_chart(state):
+    """Build a single two-panel PNG: sentiment timeline and news category mix."""
+    if not CHARTS_AVAILABLE:
+        log("Matplotlib unavailable; sending news dashboard without charts.")
+        return None
+
+    items = sorted(
+        state.get("news_history", []),
+        key=lambda item: float(item.get("ts", 0)),
+    )
+    now = time.time()
+    cutoff = now - NEWS_HISTORY_HOURS * 3600
+    items = [
+        item for item in items
+        if float(item.get("ts", 0)) >= cutoff
+    ]
+
+    fig, (ax_sentiment, ax_categories) = plt.subplots(
+        1, 2, figsize=(13, 4.8), gridspec_kw={"width_ratios": [1.55, 1]}
+    )
+    fig.patch.set_facecolor("#101827")
+    axes = (ax_sentiment, ax_categories)
+    for ax in axes:
+        ax.set_facecolor("#172235")
+        ax.tick_params(colors="#cbd5e1", labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color("#34445e")
+        ax.grid(True, color="#34445e", alpha=0.45, linewidth=0.6)
+        ax.title.set_color("#f1f5f9")
+        ax.xaxis.label.set_color("#cbd5e1")
+        ax.yaxis.label.set_color("#cbd5e1")
+
+    # Left: cumulative sentiment balance over the rolling news window.
+    ax_sentiment.set_title("NEWS SENTIMENT TIMELINE", fontsize=11, fontweight="bold", pad=12)
+    ax_sentiment.set_ylabel("Cumulative story balance", fontsize=8)
+    ax_sentiment.set_xlabel("Publication / detection time (UTC)", fontsize=8)
+    ax_sentiment.axhline(0, color="#94a3b8", linewidth=0.9, alpha=0.8)
+    if items:
+        times = []
+        balances = []
+        balance = 0
+        for item in items:
+            verdict = item.get("verdict", "")
+            if verdict.startswith("🟢"):
+                balance += 1
+            elif verdict.startswith("🔴"):
+                balance -= 1
+            times.append(datetime.fromtimestamp(float(item.get("ts", now)), timezone.utc))
+            balances.append(balance)
+        ax_sentiment.step(times, balances, where="post", color="#60a5fa", linewidth=2.3)
+        ax_sentiment.fill_between(times, balances, 0, step="post", color="#3b82f6", alpha=0.16)
+        ax_sentiment.scatter(
+            times, balances,
+            c=[
+                "#22c55e" if item.get("verdict", "").startswith("🟢")
+                else "#ef4444" if item.get("verdict", "").startswith("🔴")
+                else "#f59e0b"
+                for item in items
+            ],
+            s=24, zorder=3, edgecolors="#101827", linewidths=0.5,
+        )
+        ax_sentiment.xaxis.set_major_formatter(DateFormatter("%d %b\n%H:%M"))
+        fig.autofmt_xdate(rotation=0, ha="center")
+    else:
+        ax_sentiment.text(
+            0.5, 0.5, "Waiting for qualifying XRP news",
+            transform=ax_sentiment.transAxes, ha="center", va="center",
+            color="#cbd5e1", fontsize=10,
+        )
+        ax_sentiment.set_xticks([])
+    ax_sentiment.margins(x=0.04)
+
+    # Right: story count by topic.
+    ax_categories.set_title("NEWS CATEGORY BREAKDOWN", fontsize=11, fontweight="bold", pad=12)
+    ax_categories.set_xlabel("Independent stories", fontsize=8)
+    categories = [
+        "ETF / Funds", "Regulation", "Ripple business",
+        "Adoption / Payments", "Security", "Other XRP news",
+    ]
+    counts = {category: 0 for category in categories}
+    for item in items:
+        category = news_category(item.get("title", ""), item.get("feed", ""))
+        counts[category] = counts.get(category, 0) + 1
+    values = [counts[category] for category in categories]
+    palette = ["#60a5fa", "#a78bfa", "#22c55e", "#2dd4bf", "#ef4444", "#94a3b8"]
+    bars = ax_categories.barh(categories, values, color=palette, height=0.62)
+    ax_categories.invert_yaxis()
+    ax_categories.tick_params(axis="y", labelsize=8)
+    ax_categories.set_xlim(0, max(values + [1]) * 1.22)
+    for bar, value in zip(bars, values):
+        ax_categories.text(
+            value + 0.06, bar.get_y() + bar.get_height() / 2,
+            str(value), va="center", color="#f1f5f9", fontsize=8,
+        )
+
+    fig.suptitle(
+        f"XRP NEWS INTELLIGENCE  ·  LAST {NEWS_HISTORY_HOURS} HOURS  ·  {len(items)} STORIES",
+        color="#f8fafc", fontsize=13, fontweight="bold", y=1.02,
+    )
+    fig.tight_layout()
+    image_buffer = BytesIO()
+    fig.savefig(
+        image_buffer, format="png", dpi=150, facecolor=fig.get_facecolor(),
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+    image_buffer.seek(0)
+    return image_buffer.getvalue()
+
+
 def build_news_payload(state):
     items = sorted(
         state["news_history"],
@@ -850,14 +1017,13 @@ def build_news_payload(state):
                 "inline": False,
             },
         ],
+        "image": {"url": "attachment://xrp_news_analytics.png"},
         "footer": {
             "text": (
-                f"Updated {utc_now().strftime('%H:%M:%S UTC')} · "
-                f"Stories expire after {NEWS_HISTORY_HOURS}h · "
-                "News sentiment is not a buy/sell signal"
+                f"Rolling {NEWS_HISTORY_HOURS}h · "
+                "Independent stories only · News sentiment is not a buy/sell signal"
             )
         },
-        "timestamp": iso_now(),
     }
     return {
         "username": "XRP News Intelligence",
@@ -868,16 +1034,30 @@ def build_news_payload(state):
 
 def update_news_dashboard(state, force=False):
     payload = build_news_payload(state)
+    chart = build_news_chart(state)
+    files = (
+        [("xrp_news_analytics.png", chart, "image/png")]
+        if chart else None
+    )
+    if not chart:
+        # Avoid a broken attachment reference when chart generation is unavailable.
+        payload["embeds"][0].pop("image", None)
+
     signature = json.dumps(payload["embeds"], sort_keys=True, ensure_ascii=False)
     if not force and signature == state.get("last_news_render"):
         return
 
     try:
-        state["news_message_id"] = create_or_edit_webhook_message(
-            state.get("news_message_id"), payload
+        previous_id = state.get("news_message_id")
+        updated_id = create_or_edit_webhook_message(
+            previous_id, payload, files=files
         )
-        state["last_news_render"] = signature
-        save_state(state)
+        if updated_id:
+            state["news_message_id"] = updated_id
+            state["last_news_render"] = signature
+            save_state(state)
+        else:
+            log("News dashboard was not confirmed by Discord; will retry next scan.")
     except Exception as exc:
         log(f"News dashboard update failed: {exc}")
 
