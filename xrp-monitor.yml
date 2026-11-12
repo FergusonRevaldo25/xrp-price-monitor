@@ -1,0 +1,52 @@
+name: Live XRP Ticker and News Intelligence
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: xrp-live-monitor
+  cancel-in-progress: false
+
+jobs:
+  live-tracker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 230
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 googlenewsdecoder
+
+      - name: Run XRP ticker and news monitor
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          CMC_API_KEY: ${{ secrets.CMC_API_KEY }}
+          DISCORD_USER_ID: ${{ secrets.DISCORD_USER_ID }}
+        run: python -u xrpprice.py
+
+      - name: Persist news history and Discord message ID
+        if: always()
+        run: |
+          if [ -f xrp_state.json ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add xrp_state.json
+            if ! git diff --cached --quiet; then
+              git commit -m "Update XRP monitor state [skip ci]"
+              git push origin "HEAD:${GITHUB_REF_NAME}"
+            fi
+          fi

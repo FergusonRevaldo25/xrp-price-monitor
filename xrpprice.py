@@ -1,9 +1,23 @@
+#!/usr/bin/env python3
+"""
+XRP price and news monitor.
+
+Price dashboard: one Discord message, edited in place.
+News dashboard: one separate Discord message, edited in place.
+News history: persisted to xrp_state.json between GitHub Actions runs.
+"""
+
+import json
 import os
 import re
 import sys
 import time
+import hashlib
+import html
 import xml.etree.ElementTree as ET
 from collections import deque
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -13,23 +27,34 @@ try:
 except Exception:
     gnewsdecoder = None
 
-# ===== SETTINGS =====
-HARDCODED_WEBHOOK = "https://discord.com/api/webhooks/1564239707515260938/MdCL16AZn4Yfydf6iWyFr0FAr-26ldTtLwotiM6YhShtWpa-1tQGtZZh7NmFjGgHlUCf"   # paste your webhook here
-HARDCODED_CMC_KEY = ""      # optional: prefer the CMC_API_KEY GitHub secret instead
-DISCORD_USER_ID = ""        # paste your Discord user ID here
+
+# ---------------------------------------------------------------------------
+# SETTINGS
+# ---------------------------------------------------------------------------
+
 BUY_LEVEL_ZAR = 21.50
-ALERT_DIRECTION = "above"   # "above" or "below"
-PCT_MOVE_ALERT = 3.0        # % move within 1 hour (0 = off)
-CMC_EVERY_MINUTES = 10      # how often to ask CoinMarketCap (free plan has a monthly limit)
-NEWS_CHECK_EVERY = 5        # minutes
-SEND_MIXED = True           # False = drops all 🟡 alerts (mixed AND Ripple-growth news)
-# ====================
+ALERT_DIRECTION = "above"       # "above" or "below"
+PCT_MOVE_ALERT = 3.0            # % move over roughly one hour; 0 disables
+CMC_EVERY_MINUTES = 10
+NEWS_CHECK_EVERY = 5            # minutes
+RUN_MINUTES = 210               # 3.5 hours; workflow starts every 4 hours
+NEWS_HISTORY_HOURS = 48
+MAX_NEWS_ITEMS = 100
+MAX_DISPLAY_NEWS = 6
+MAX_ALERTS_PER_SCAN = 5
+
+SEND_MIXED = True
+SEND_CRITICAL_NEWS_ALERTS = True  # critical news also gets one separate alert
+STATE_FILE = os.getenv("XRP_STATE_FILE", "xrp_state.json")
 
 CMC_URL = "https://pro-api.coinmarketcap.com/v2/cryptocurrency/quotes/latest"
 CMC_XRP_ID = "52"
 
 NEWS_FEEDS = {
-    "SEC": {"url": "https://www.sec.gov/news/pressreleases.rss", "mode": "sec"},
+    "SEC": {
+        "url": "https://www.sec.gov/news/pressreleases.rss",
+        "mode": "sec",
+    },
     "Ripple": {
         "url": "https://news.google.com/rss/search?q=site:ripple.com+when:7d&hl=en-US&gl=US&ceid=US:en",
         "mode": "ripple",
@@ -48,458 +73,910 @@ NEWS_FEEDS = {
     },
 }
 
-TRUSTED_SOURCES = [
-    "reuters", "bloomberg", "coindesk", "the block", "cointelegraph", "decrypt",
-    "cnbc", "wall street journal", "wsj", "financial times", "forbes", "fortune",
-    "yahoo finance", "marketwatch", "barron", "ripple", "sec.gov", "securities and exchange",
-]
+# Trust is based on the actual publisher/source or resolved article hostname,
+# not merely a word appearing in the headline.
+TRUSTED_SOURCES = {
+    "reuters.com", "bloomberg.com", "coindesk.com", "theblock.co",
+    "cointelegraph.com", "decrypt.co", "cnbc.com", "wsj.com",
+    "ft.com", "forbes.com", "fortune.com", "finance.yahoo.com",
+    "marketwatch.com", "barrons.com", "ripple.com", "sec.gov",
+    "securities.io",
+}
+TRUSTED_SOURCE_NAMES = {
+    "reuters", "bloomberg", "coindesk", "the block", "cointelegraph",
+    "decrypt", "cnbc", "wall street journal", "financial times",
+    "forbes", "fortune", "yahoo finance", "marketwatch", "barron's",
+    "barrons", "ripple", "u.s. securities and exchange commission",
+    "sec",
+}
 
 BLOCK_WORDS = [
-    "price prediction", "price forecast", "predicts", "prediction", "could hit", "will hit",
-    "to the moon", "giveaway", "airdrop", "presale", "pre-sale", "100x", "1000x", "next bitcoin",
-    "best crypto to buy", "top 5", "top 10", "meme coin", "memecoin", "buy now", "millionaire",
-    "sponsored", "advertorial", "get rich", "passive income", "price analysis",
-    "live price", "price, news", "price today", "price chart", "converter", "to usd", "to zar",
+    "price prediction", "price forecast", "predicts", "prediction",
+    "could hit", "will hit", "to the moon", "giveaway", "airdrop",
+    "presale", "pre-sale", "100x", "1000x", "next bitcoin",
+    "best crypto to buy", "top 5", "top 10", "meme coin", "memecoin",
+    "buy now", "millionaire", "sponsored", "advertorial", "get rich",
+    "passive income", "price analysis", "live price", "price chart",
+    "converter", "price today",
 ]
 
 PRIORITY_WORDS = [
-    "approved", "approval", "approves", "lawsuit", "ruling", "court", "etf", "settlement",
-    "license", "licence", "acquisition", "acquires", "partnership", "delist", "hack",
-    "breach", "injunction", "appeal", "dismiss", "charges", "launch",
+    "approved", "approval", "lawsuit", "ruling", "court", "etf",
+    "settlement", "license", "licence", "acquisition", "acquires",
+    "partnership", "delist", "hack", "breach", "injunction",
+    "appeal", "dismiss", "charges", "launch",
 ]
 
 BULLISH = {
-    "net inflow": 2, "inflows": 2, "etf approved": 3, "approves": 2, "approved": 2, "approval": 1,
-    "drops lawsuit": 3, "dismissed": 2, "dismisses": 2, "drops appeal": 3, "wins": 2, "settles": 2,
-    "partnership": 2, "partners with": 2, "adopts": 2, "adoption": 1, "integrates": 2,
-    "licence granted": 3, "license granted": 3, "granted a licence": 3, "granted a license": 3,
-    "regulatory clarity": 2, "launches": 1, "launch": 1, "acquires": 2, "acquisition": 1,
-    "record high": 2, "all-time high": 2, "surge": 1, "rallies": 1, "rlusd": 1, "bullish": 1,
-}
-BEARISH = {
-    "net outflow": 2, "outflows": 2, "rejected": 2, "rejects": 2, "delays": 2, "delayed": 2,
-    "hack": 3, "hacked": 3, "breach": 3, "exploit": 2, "sues": 2, "sued": 2, "lawsuit filed": 2,
-    "fraud": 3, "investigation": 2, "fined": 2, "fine": 1, "charges": 2, "ban": 2, "bans": 2,
-    "crash": 2, "plunge": 2, "plunges": 2, "sell-off": 1, "selloff": 1, "dump": 1, "delist": 3,
-    "bearish": 1, "warns": 1, "concern": 1, "uncertainty": 1,
+    "net inflow": 3, "net inflows": 3, "inflows": 2,
+    "etf approved": 3, "etf approval": 3,
+    "approves": 2, "approved": 2, "approval": 1,
+    "drops lawsuit": 3, "dismissed": 2, "dismisses": 2,
+    "drops appeal": 3, "wins": 2, "settles": 1,
+    "partnership": 1, "partners with": 1, "adopts": 2,
+    "adoption": 1, "integrates": 1,
+    "licence granted": 3, "license granted": 3,
+    "granted a licence": 3, "granted a license": 3,
+    "regulatory clarity": 2, "launches": 1, "launch": 1,
+    "acquires": 1, "acquisition": 1, "record high": 2,
+    "all-time high": 2, "surge": 1, "rallies": 1,
+    "bullish": 1, "institutional demand": 2,
+    "institutional adoption": 2,
 }
 
-# Signs that a story directly creates demand for XRP itself (not just Ripple's business)
-DIRECT_XRP_WORDS = [
-    "etf inflow", "etf inflows", "spot xrp etf", "xrp etf", "xrp treasury", "xrp reserve",
-    "xrp holdings", "buys xrp", "buying xrp", "purchase of xrp", "on-demand liquidity", "odl",
-    "xrp bridge", "xrp payments", "xrp-based", "uses xrp", "using xrp", "lists xrp",
-    "xrp listing", "xrp as a bridge", "xrp adoption",
+BEARISH = {
+    "net outflow": 3, "net outflows": 3, "outflows": 2,
+    "rejected": 2, "rejects": 2, "delays": 2, "delayed": 2,
+    "hack": 3, "hacked": 3, "breach": 3, "exploit": 3,
+    "sues": 2, "sued": 2, "lawsuit filed": 2,
+    "fraud": 3, "investigation": 2, "fined": 2, "fine": 1,
+    "charges": 2, "ban": 2, "bans": 2, "crash": 2,
+    "plunge": 2, "plunges": 2, "sell-off": 1, "selloff": 1,
+    "dump": 1, "delist": 3, "bearish": 1, "warns": 1,
+    "concern": 1, "uncertainty": 1, "withdraws": 2,
+    "withdrawn": 2, "suspends": 2, "suspended": 2,
+}
+
+# These are deliberately stricter than simply seeing "XRP ETF".
+DIRECT_DEMAND_PATTERNS = [
+    r"\b(etf|funds?)\b.{0,45}\b(net )?inflows?\b",
+    r"\b(inflows?)\b.{0,45}\b(xrp|etf)\b",
+    r"\b(buys?|bought|purchases?|purchased|accumulates?)\b.{0,45}\bxrp\b",
+    r"\bxrp\b.{0,45}\b(buys?|bought|purchases?|purchased|accumulates?)\b",
+    r"\b(xrp payments?|xrp-based payments?|on-demand liquidity|odl)\b",
+    r"\buses? xrp\b|\busing xrp\b|\bxrp as (a )?bridge\b",
+    r"\b(xrp treasury|xrp reserve|xrp holdings)\b",
+    r"\badds? xrp\b.{0,35}\b(reserves?|holdings?|treasury)\b",
 ]
+DIRECT_DEMAND_RE = [re.compile(p, re.I) for p in DIRECT_DEMAND_PATTERNS]
 
 RELEVANT_RE = re.compile(r"\bxrp\b|\bripple\b|garlinghouse|rlusd", re.I)
+NEGATION_RE = re.compile(
+    r"\b(no|not|never|without|fails? to|failed to|denies?|denied|"
+    r"rejects?|rejected|halts?|halted|slows?|slowed|weak|lower|declines?)\b",
+    re.I,
+)
 
-WEBHOOK = (os.getenv("DISCORD_WEBHOOK_URL") or "").strip()
-if not WEBHOOK and HARDCODED_WEBHOOK.startswith("https://"):
-    WEBHOOK = HARDCODED_WEBHOOK.strip()
-
-CMC_KEY = (os.getenv("CMC_API_KEY") or "").strip() or HARDCODED_CMC_KEY.strip()
-
-HEADERS = {"User-Agent": "Mozilla/5.0 (xrp-price-monitor; personal use)"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; XRPMonitor/2.0)"}
 BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+WEBHOOK = (os.getenv("DISCORD_WEBHOOK_URL") or "").strip()
+CMC_KEY = (os.getenv("CMC_API_KEY") or "").strip()
+DISCORD_USER_ID = (os.getenv("DISCORD_USER_ID") or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# STATE AND UTILITIES
+# ---------------------------------------------------------------------------
 
 def log(*args):
     print(*args, flush=True)
 
 
-# ---------- prices ----------
-def get_usd_to_zar():
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def iso_now():
+    return utc_now().isoformat(timespec="seconds")
+
+
+def empty_state():
+    return {
+        "version": 2,
+        "news_message_id": None,
+        "news_history": [],
+        "seen_links": {},
+        "seen_titles": [],
+        "initialized": {},
+        "urgent_sent": [],
+        "last_news_render": "",
+        "fx_rate": None,
+        "fx_rate_time": None,
+    }
+
+
+def load_state():
+    state = empty_state()
     try:
-        f = requests.get("https://open.er-api.com/v6/latest/USD", headers=HEADERS, timeout=10)
-        return float(f.json()["rates"]["ZAR"])
-    except Exception as e:
-        log(f"Fiat fetch fail: {e}")
-        return 18.00
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        if isinstance(saved, dict):
+            state.update(saved)
+    except FileNotFoundError:
+        log("No prior state file; starting a new state.")
+    except Exception as exc:
+        log(f"State file could not be read; starting safely: {exc}")
+
+    # Keep expected types valid if a partial/old state file is found.
+    for key, default in empty_state().items():
+        # None defaults are optional fields (e.g. Discord message ID and FX rate).
+        # Accept their later non-None values when loading persisted state.
+        if default is None:
+            continue
+        if not isinstance(state.get(key), type(default)):
+            state[key] = default
+    return state
 
 
-def fetch_cmc():
-    """Free plan allows only ONE convert currency, so ask for ZAR and derive USD from the exchange rate."""
-    r = requests.get(
+def save_state(state):
+    """Atomic local save. The workflow commits this file after the run."""
+    tmp = STATE_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, STATE_FILE)
+    except Exception as exc:
+        log(f"WARNING: state save failed: {exc}")
+
+
+def prune_state(state):
+    cutoff = time.time() - NEWS_HISTORY_HOURS * 3600
+    state["news_history"] = [
+        item for item in state["news_history"]
+        if isinstance(item, dict) and float(item.get("ts", 0)) >= cutoff
+    ][-MAX_NEWS_ITEMS:]
+
+    state["urgent_sent"] = [
+        item for item in state["urgent_sent"]
+        if isinstance(item, dict) and float(item.get("ts", 0)) >= cutoff
+    ][-100:]
+
+    # Bound URL/title memory while retaining recent dedupe protection.
+    for feed, links in list(state["seen_links"].items()):
+        if isinstance(links, list):
+            state["seen_links"][feed] = links[-250:]
+        else:
+            state["seen_links"][feed] = []
+    state["seen_titles"] = state["seen_titles"][-500:]
+
+
+def short_num(number, prefix=""):
+    number = float(number)
+    for limit, suffix in (
+        (1e15, "Q"), (1e12, "T"), (1e9, "B"),
+        (1e6, "M"), (1e3, "K"),
+    ):
+        if abs(number) >= limit:
+            return f"{prefix}{number / limit:,.2f}{suffix}"
+    return f"{prefix}{number:,.2f}"
+
+
+def safe_float(value):
+    try:
+        result = float(value)
+        return result if result == result and abs(result) != float("inf") else None
+    except (TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# PRICE DATA
+# ---------------------------------------------------------------------------
+
+def get_usd_to_zar(state):
+    try:
+        response = requests.get(
+            "https://open.er-api.com/v6/latest/USD",
+            headers=HEADERS, timeout=10
+        )
+        response.raise_for_status()
+        rate = safe_float(response.json().get("rates", {}).get("ZAR"))
+        if rate and rate > 0:
+            state["fx_rate"] = rate
+            state["fx_rate_time"] = time.time()
+            return rate
+    except Exception as exc:
+        log(f"Fiat fetch failed: {exc}")
+
+    cached = safe_float(state.get("fx_rate"))
+    if cached and cached > 0:
+        age = time.time() - float(state.get("fx_rate_time") or 0)
+        if age <= 24 * 3600:
+            log(f"Using cached USD/ZAR rate ({age / 3600:.1f}h old).")
+            return cached
+    raise RuntimeError("No current or recent USD/ZAR exchange rate available.")
+
+
+def fetch_cmc(state):
+    response = requests.get(
         CMC_URL,
         headers={"X-CMC_PRO_API_KEY": CMC_KEY, "Accept": "application/json"},
         params={"id": CMC_XRP_ID, "convert": "ZAR"},
         timeout=15,
     )
-    if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-    d = r.json()["data"][CMC_XRP_ID]
-    if isinstance(d, list):
-        d = d[0]
-    zar = d["quote"]["ZAR"]
-    price_zar = float(zar["price"])
-    mcap_zar = float(zar.get("market_cap") or 0)
-    if not mcap_zar and d.get("circulating_supply"):
-        mcap_zar = price_zar * float(d["circulating_supply"])
-    usd_to_zar = get_usd_to_zar()
+    if response.status_code != 200:
+        raise RuntimeError(f"CoinMarketCap HTTP {response.status_code}: {response.text[:200]}")
+    data = response.json()["data"][CMC_XRP_ID]
+    if isinstance(data, list):
+        data = data[0]
+    quote = data["quote"]["ZAR"]
+    price_zar = float(quote["price"])
+    market_cap_zar = float(quote.get("market_cap") or 0)
+    if not market_cap_zar and data.get("circulating_supply"):
+        market_cap_zar = price_zar * float(data["circulating_supply"])
+    rate = get_usd_to_zar(state)
     return {
         "price_zar": price_zar,
-        "mcap_zar": mcap_zar,
-        "price_usd": price_zar / usd_to_zar,
-        "mcap_usd": mcap_zar / usd_to_zar,
-        "usd_to_zar": usd_to_zar,
+        "mcap_zar": market_cap_zar,
+        "price_usd": price_zar / rate,
+        "mcap_usd": market_cap_zar / rate,
+        "usd_to_zar": rate,
         "source": "CoinMarketCap",
     }
 
 
-def fetch_coinlore():
-    r = requests.get("https://api.coinlore.net/api/ticker/?id=58", headers=HEADERS, timeout=10)
-    coin = r.json()[0]
+def fetch_coinlore(state):
+    response = requests.get(
+        "https://api.coinlore.net/api/ticker/?id=58",
+        headers=HEADERS, timeout=10
+    )
+    response.raise_for_status()
+    coin = response.json()[0]
     price_usd = float(coin["price_usd"])
-    mcap_usd = float(coin["market_cap_usd"])
-    usd_to_zar = get_usd_to_zar()
+    market_cap_usd = float(coin["market_cap_usd"])
+    rate = get_usd_to_zar(state)
     return {
         "price_usd": price_usd,
-        "price_zar": price_usd * usd_to_zar,
-        "mcap_usd": mcap_usd,
-        "mcap_zar": mcap_usd * usd_to_zar,
-        "usd_to_zar": usd_to_zar,
+        "price_zar": price_usd * rate,
+        "mcap_usd": market_cap_usd,
+        "mcap_zar": market_cap_usd * rate,
+        "usd_to_zar": rate,
         "source": "CoinLore (backup)",
     }
 
 
-def get_prices(state):
-    """Returns (data, fresh). CoinMarketCap is polled every CMC_EVERY_MINUTES, CoinLore is the backup."""
+def get_prices(state, price_state):
     now = time.time()
-
-    if CMC_KEY and now >= state["next_cmc"]:
+    if CMC_KEY and now >= price_state["next_cmc"]:
         try:
-            data = fetch_cmc()
+            data = fetch_cmc(state)
             data["time"] = now
-            state["cmc"] = data
-            state["next_cmc"] = now + CMC_EVERY_MINUTES * 60
+            price_state["cmc"] = data
+            price_state["next_cmc"] = now + CMC_EVERY_MINUTES * 60
             log(f"CoinMarketCap OK: R{data['price_zar']:.2f}")
             return data, True
-        except Exception as e:
-            log(f"CoinMarketCap fetch failed: {e}")
-            state["next_cmc"] = now + 120  # retry in 2 minutes
+        except Exception as exc:
+            log(f"CoinMarketCap fetch failed: {exc}")
+            price_state["next_cmc"] = now + 120
 
-    cmc = state.get("cmc")
-    if cmc and now - cmc["time"] < 30 * 60:
-        return cmc, False  # still fresh enough, reuse
+    cached = price_state.get("cmc")
+    if cached and now - cached["time"] < 30 * 60:
+        return cached, False
 
-    try:  # backup source
-        data = fetch_coinlore()
+    try:
+        data = fetch_coinlore(state)
         data["time"] = now
         return data, True
-    except Exception as e:
-        log(f"CoinLore fetch failed: {e}")
+    except Exception as exc:
+        log(f"CoinLore fetch failed: {exc}")
         return None, False
 
 
-def short_num(n, prefix=""):
-    """Format a big number with a letter: K thousand, M million, B billion, T trillion, Q quadrillion."""
-    n = float(n)
-    for limit, letter in ((1e15, "Q"), (1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
-        if abs(n) >= limit:
-            return f"{prefix}{n / limit:,.2f}{letter}"
-    return f"{prefix}{n:,.2f}"
-
-
-def build_payload(d):
-    updated = time.strftime("%H:%M", time.gmtime(d["time"]))
+def build_price_payload(data):
+    updated = time.strftime("%H:%M:%S", time.gmtime(data["time"]))
     return {
         "username": "XRP Live Dashboard",
         "embeds": [{
             "title": "⚡ Live XRP Market Ticker",
             "color": 5763719,
             "fields": [
-                {"name": "💵 Price (USD)", "value": f"${d['price_usd']:,.4f}", "inline": True},
-                {"name": "🇿🇦 Price (ZAR)", "value": f"R {d['price_zar']:,.2f}", "inline": True},
+                {"name": "💵 Price (USD)", "value": f"${data['price_usd']:,.4f}", "inline": True},
+                {"name": "🇿🇦 Price (ZAR)", "value": f"R {data['price_zar']:,.2f}", "inline": True},
                 {"name": "\u200b", "value": "\u200b", "inline": False},
-                {"name": "📈 Market Cap (USD)", "value": short_num(d["mcap_usd"], "$"), "inline": True},
-                {"name": "🇿🇦 Market Cap (ZAR)", "value": short_num(d["mcap_zar"], "R "), "inline": True},
+                {"name": "📈 Market Cap (USD)", "value": short_num(data["mcap_usd"], "$"), "inline": True},
+                {"name": "🇿🇦 Market Cap (ZAR)", "value": short_num(data["mcap_zar"], "R "), "inline": True},
             ],
-            "footer": {"text": f"{d['source']} · price as of {updated} UTC · buy alert R {BUY_LEVEL_ZAR:.2f}"},
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "footer": {
+                "text": f"{data['source']} · price as of {updated} UTC · level R {BUY_LEVEL_ZAR:.2f}"
+            },
+            "timestamp": iso_now(),
         }],
     }
 
 
-def send_alert(text):
+# ---------------------------------------------------------------------------
+# DISCORD
+# ---------------------------------------------------------------------------
+
+def send_alert(message):
+    if not WEBHOOK:
+        return
     mention = f"<@{DISCORD_USER_ID}> " if DISCORD_USER_ID else ""
     payload = {
         "username": "XRP Alerts",
-        "content": f"{mention}{text}"[:1990],
+        "content": f"{mention}{message}"[:1990],
         "allowed_mentions": {"users": [DISCORD_USER_ID]} if DISCORD_USER_ID else {"parse": []},
     }
     try:
-        res = requests.post(WEBHOOK, json=payload, timeout=10)
-        if res.status_code not in (200, 204):
-            log("Alert failed:", res.status_code, res.text)
-    except Exception as e:
-        log(f"Alert error: {e}")
+        response = requests.post(WEBHOOK, json=payload, timeout=15)
+        if response.status_code not in (200, 204):
+            log("Alert post failed:", response.status_code, response.text[:300])
+    except Exception as exc:
+        log(f"Alert error: {exc}")
 
 
-# ---------- news fetching ----------
+def create_or_edit_webhook_message(message_id, payload):
+    """Create once, then edit the same webhook message."""
+    if message_id:
+        response = requests.patch(
+            f"{WEBHOOK}/messages/{message_id}", json=payload, timeout=15
+        )
+        if response.status_code in (200, 204):
+            return message_id
+        log(f"Discord edit failed ({response.status_code}); will recreate.")
+        if response.status_code not in (404, 10008):
+            return message_id
+
+    response = requests.post(
+        f"{WEBHOOK}?wait=true", json=payload, timeout=15
+    )
+    if response.status_code not in (200, 201):
+        log(f"Discord message create failed: {response.status_code} {response.text[:300]}")
+        return message_id
+    try:
+        return response.json().get("id")
+    except Exception:
+        return message_id
+
+
+# ---------------------------------------------------------------------------
+# NEWS FETCHING AND FILTERING
+# ---------------------------------------------------------------------------
+
 def fetch_feed(url):
-    """Returns a list of (title, link, source)."""
-    r = requests.get(url, headers=HEADERS, timeout=15)
-    r.raise_for_status()
-    root = ET.fromstring(r.content)
-    items = []
-    for it in root.iter("item"):  # RSS
-        title = (it.findtext("title") or "").strip()
-        link = (it.findtext("link") or "").strip()
-        source = (it.findtext("source") or "").strip()
+    response = requests.get(url, headers=HEADERS, timeout=20)
+    response.raise_for_status()
+    root = ET.fromstring(response.content)
+    entries = []
+
+    for item in root.iter("item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        source_node = item.find("source")
+        source = (source_node.text or "").strip() if source_node is not None else ""
+        pub_date = (item.findtext("pubDate") or "").strip()
         if title and link:
-            items.append((title, link, source))
-    if not items:  # Atom fallback
+            entries.append({"title": title, "link": link, "source": source, "published": pub_date})
+
+    if not entries:
         ns = "{http://www.w3.org/2005/Atom}"
-        for e in root.iter(f"{ns}entry"):
-            title = (e.findtext(f"{ns}title") or "").strip()
-            l = e.find(f"{ns}link")
-            link = l.get("href") if l is not None else ""
+        for entry in root.iter(f"{ns}entry"):
+            title_node = entry.find(f"{ns}title")
+            link_node = entry.find(f"{ns}link")
+            title = (title_node.text or "").strip() if title_node is not None else ""
+            link = link_node.get("href", "") if link_node is not None else ""
             if title and link:
-                items.append((title, link, ""))
-    return items
+                entries.append({"title": title, "link": link, "source": "", "published": ""})
+    return entries
 
 
 def resolve_url(link):
-    """Google News links are redirects; decode them to the real article URL."""
     if "news.google.com" in link and gnewsdecoder:
         try:
-            res = gnewsdecoder(link, interval=1)
-            if res.get("status") and res.get("decoded_url"):
-                return res["decoded_url"]
-        except Exception as e:
-            log(f"Could not decode Google link: {e}")
+            decoded = gnewsdecoder(link, interval=1)
+            if decoded.get("status") and decoded.get("decoded_url"):
+                return decoded["decoded_url"]
+        except Exception as exc:
+            log(f"Google News URL decode failed: {exc}")
     return link
 
 
 def fetch_article_text(url):
-    """Returns the article's paragraph text, or '' if it can't be read (paywall, block, error)."""
     try:
-        r = requests.get(url, headers=BROWSER_HEADERS, timeout=12)
-        if r.status_code != 200 or "html" not in r.headers.get("Content-Type", ""):
+        response = requests.get(url, headers=BROWSER_HEADERS, timeout=15)
+        content_type = response.headers.get("Content-Type", "").lower()
+        if response.status_code != 200 or "html" not in content_type:
             return ""
-        soup = BeautifulSoup(r.text, "html.parser")
+        soup = BeautifulSoup(response.text, "html.parser")
         for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
             tag.decompose()
-        paras = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
-        text = " ".join(p for p in paras if len(p) > 40)
-        return text[:10000]
-    except Exception as e:
-        log(f"Article fetch failed: {e}")
+        paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+        return " ".join(p for p in paragraphs if len(p) > 40)[:12000]
+    except Exception as exc:
+        log(f"Article fetch failed: {exc}")
         return ""
 
 
-# ---------- filters ----------
-def is_relevant(title):
-    return bool(RELEVANT_RE.search(title)) and "ripple effect" not in title.lower()
+def normalize_title(title):
+    value = html.unescape(title).lower()
+    value = re.sub(r"https?://\S+", " ", value)
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def story_id(title, url):
+    # Headline identity is stable across different publisher URLs for the same story.
+    normalized = normalize_title(title)
+    return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def domain_of(url):
+    try:
+        host = (urlparse(url).hostname or "").lower()
+        return host[4:] if host.startswith("www.") else host
+    except Exception:
+        return ""
+
+
+def is_trusted(source, url):
+    source_l = (source or "").lower().strip()
+    domain = domain_of(url)
+    if domain == "sec.gov" or domain.endswith(".sec.gov"):
+        return True
+    if domain in TRUSTED_SOURCES or any(domain.endswith("." + d) for d in TRUSTED_SOURCES):
+        return True
+    return any(name in source_l for name in TRUSTED_SOURCE_NAMES)
 
 
 def is_blocked(title):
-    t = title.lower()
-    return any(b in t for b in BLOCK_WORDS)
+    low = title.lower()
+    return any(word in low for word in BLOCK_WORDS)
 
 
-def is_trusted(title, source):
-    text = f"{source} {title}".lower()
-    return any(s in text for s in TRUSTED_SOURCES)
-
-
-def is_priority(title):
-    t = title.lower()
-    return any(p in t for p in PRIORITY_WORDS)
-
-
-def passes_filters(mode, title, source):
+def passes_filters(mode, title, source, url):
     if is_blocked(title):
         return False
     if mode == "ripple":
+        # Official Ripple feed is inherently a primary source.
         return True
-    if not is_relevant(title):
+    if not RELEVANT_RE.search(title):
         return False
     if mode == "news":
-        return is_trusted(title, source)
-    return True  # sec: relevant to Ripple/XRP is enough
+        return is_trusted(source, url)
+    return mode == "sec"
 
 
-# ---------- analysis ----------
 def split_sentences(text):
-    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if 30 < len(s.strip()) < 600]
+    return [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", text)
+        if 30 < len(sentence.strip()) < 700
+    ]
 
 
-def analyse(title, text):
-    """Returns (score, verdict, key_sentence, basis)."""
-    article_sentences = split_sentences(text) if text else []
+# ---------------------------------------------------------------------------
+# NEWS ANALYSIS
+# ---------------------------------------------------------------------------
+
+def sentence_score(sentence):
+    low = sentence.lower()
+    positive = sum(weight for phrase, weight in BULLISH.items() if phrase in low)
+    negative = sum(weight for phrase, weight in BEARISH.items() if phrase in low)
+
+    # Basic local negation handling: "not approved", "no inflows", etc.
+    if NEGATION_RE.search(low):
+        positive, negative = negative, positive
+
+    return max(-3, min(3, positive - negative))
+
+
+def has_direct_xrp_demand(text):
+    return any(pattern.search(text) for pattern in DIRECT_DEMAND_RE)
+
+
+def analyse(title, article_text):
+    article_sentences = split_sentences(article_text) if article_text else []
     relevant = [s for s in article_sentences if RELEVANT_RE.search(s)][:40]
-    sentences = [title, title] + relevant  # headline counts double
+    headline_score = sentence_score(title)
+    body_scores = [sentence_score(sentence) for sentence in relevant]
 
-    score = 0
-    best = (0, "")
-    for s in sentences:
-        low = s.lower()
-        s_score = 0
-        for phrase, w in BULLISH.items():
-            if phrase in low:
-                s_score += w
-        for phrase, w in BEARISH.items():
-            if phrase in low:
-                s_score -= w
-        s_score = max(-3, min(3, s_score))  # cap per sentence
-        score += s_score
-        if abs(s_score) > best[0] and s != title:
-            best = (abs(s_score), s)
-
+    # Headline counts twice, body contributes evidence but is capped to limit repetition.
+    score = headline_score * 2 + max(-5, min(5, sum(body_scores)))
     headline_only = not relevant
-    threshold = 2 if headline_only else 3
 
-    blob = (title + " " + " ".join(relevant[:15])).lower()
-    direct_xrp = any(w in blob for w in DIRECT_XRP_WORDS)
+    evidence_text = (title + " " + " ".join(relevant[:20])).lower()
+    direct_demand = has_direct_xrp_demand(evidence_text)
 
+    threshold = 3 if headline_only else 4
+    strongest = max(
+        relevant,
+        key=lambda sentence: abs(sentence_score(sentence)),
+        default="",
+    )
+
+    # Avoid classifying a general Ripple business announcement as direct XRP demand.
     if score >= threshold:
-        if direct_xrp:
-            verdict = "🟢 GOOD FOR XRP"
-        else:
-            verdict = "🟡 RIPPLE GROWTH (indirect for XRP)"
+        verdict = "🟢 GOOD FOR XRP" if direct_demand else "🟡 RIPPLE GROWTH"
     elif score <= -threshold:
         verdict = "🔴 BAD NEWS"
+    elif any(word in evidence_text for word in ("sec", "court", "ruling", "regulation", "regulatory")):
+        verdict = "🔵 REGULATORY"
     else:
-        verdict = "🟡 MIXED / NEUTRAL"
+        verdict = "🟠 MIXED / NEUTRAL"
 
-    key = best[1] or (relevant[0] if relevant else "")
-    if len(key) > 220:
-        key = key[:217].rstrip() + "..."
-    basis = "headline only" if headline_only else "read full article"
-    return score, verdict, key, basis
+    confidence = "Low"
+    if relevant and abs(score) >= threshold + 2:
+        confidence = "Medium"
+    if relevant and abs(score) >= threshold + 4 and len(relevant) >= 3:
+        confidence = "High"
+
+    basis = "headline only" if headline_only else "article text"
+    return {
+        "score": int(score),
+        "verdict": verdict,
+        "key_sentence": strongest[:260],
+        "basis": basis,
+        "direct_demand": direct_demand,
+        "confidence": confidence,
+    }
 
 
-def check_news(seen_links, seen_titles, initialized):
-    for name, cfg in NEWS_FEEDS.items():
+def is_critical(title, analysis):
+    low = title.lower()
+    critical_terms = (
+        "hack", "hacked", "exploit", "security breach", "fraud",
+        "etf rejected", "etf rejection", "court rules", "sec ruling",
+        "license revoked", "licence revoked", "bankruptcy",
+    )
+    return (
+        any(term in low for term in critical_terms)
+        or ("🔴" in analysis["verdict"] and analysis["score"] <= -6)
+    )
+
+
+def record_news(state, feed_name, title, url, source, analysis):
+    now = time.time()
+    sid = story_id(title, url)
+    existing = next(
+        (item for item in state["news_history"] if item.get("story_id") == sid),
+        None,
+    )
+
+    if existing:
+        # Another outlet has covered the same headline: record corroboration,
+        # but do not count it as another independent story.
+        outlets = existing.setdefault("outlets", [])
+        outlet = source or domain_of(url) or feed_name
+        if outlet not in outlets:
+            outlets.append(outlet)
+        existing["last_seen"] = now
+        return False, existing
+
+    item = {
+        "story_id": sid,
+        "ts": now,
+        "last_seen": now,
+        "title": title[:300],
+        "url": url,
+        "source": source or domain_of(url) or feed_name,
+        "feed": feed_name,
+        "verdict": analysis["verdict"],
+        "score": analysis["score"],
+        "confidence": analysis["confidence"],
+        "direct_demand": analysis["direct_demand"],
+        "key_sentence": analysis["key_sentence"],
+        "basis": analysis["basis"],
+        "outlets": [source or domain_of(url) or feed_name],
+    }
+    state["news_history"].append(item)
+    return True, item
+
+
+def send_critical_once(state, item):
+    if not SEND_CRITICAL_NEWS_ALERTS:
+        return
+    if not is_critical(item["title"], {
+        "verdict": item["verdict"], "score": item["score"]
+    }):
+        return
+    sid = item["story_id"]
+    if any(record.get("story_id") == sid for record in state["urgent_sent"]):
+        return
+    send_alert(
+        f"🚨 **CRITICAL XRP NEWS — PLEASE REVIEW**\n"
+        f"**{item['title']}**\n"
+        f"Source: {item['source']}\n"
+        f"<{item['url']}>"
+    )
+    state["urgent_sent"].append({"story_id": sid, "ts": time.time()})
+
+
+def process_news(state):
+    new_count = 0
+    for feed_name, config in NEWS_FEEDS.items():
         try:
-            items = fetch_feed(cfg["url"])
-        except Exception as e:
-            log(f"News feed '{name}' failed: {e}")
+            entries = fetch_feed(config["url"])
+        except Exception as exc:
+            log(f"News feed '{feed_name}' failed: {exc}")
             continue
 
-        new = []
-        for title, link, source in items:
-            key = re.sub(r"\W+", " ", title.lower()).strip()
-            if link in seen_links[name] or key in seen_titles:
-                seen_links[name].add(link)
+        known_links = set(state["seen_links"].get(feed_name, []))
+        fresh_entries = []
+        for entry in entries:
+            link = entry["link"]
+            if link in known_links:
                 continue
-            seen_links[name].add(link)
-            seen_titles.add(key)
-            new.append((title, link, source))
+            known_links.add(link)
+            fresh_entries.append(entry)
 
-        if not initialized[name]:
-            initialized[name] = True  # first load: remember existing items, don't flood the channel
-            log(f"News feed '{name}' ready ({len(items)} items)")
-            continue
+        state["seen_links"][feed_name] = list(known_links)[-250:]
 
-        sent = 0
-        for title, link, source in new:
-            if not passes_filters(cfg["mode"], title, source):
+        if not state["initialized"].get(feed_name, False):
+            state["initialized"][feed_name] = True
+            # On first-ever run, process recent entries rather than silently
+            # dropping the entire initial feed. Cap prevents a large first flood.
+            fresh_entries = entries[:10]
+            log(f"News feed '{feed_name}' initialized ({len(entries)} items).")
+
+        processed = 0
+        for entry in fresh_entries:
+            title, link, source = entry["title"], entry["link"], entry["source"]
+            key = normalize_title(title)
+            if key in state["seen_titles"]:
+                continue
+            resolved = resolve_url(link)
+            if not passes_filters(config["mode"], title, source, resolved):
+                state["seen_titles"].append(key)
                 continue
 
-            url = resolve_url(link)
-            text = fetch_article_text(url)
-            score, verdict, key, basis = analyse(title, text)
-
-            if verdict.startswith("🟡") and not SEND_MIXED:
+            article_text = fetch_article_text(resolved)
+            result = analyse(title, article_text)
+            if result["verdict"].startswith("🟠") and not SEND_MIXED:
+                state["seen_titles"].append(key)
                 continue
 
-            tag = "🚨 " if is_priority(title) else ""
-            src = f" ({source})" if source else ""
-            lines = [f"{tag}{verdict} · {name}{src}", f"**{title}**"]
-            if key:
-                lines.append(f"> {key}")
-            lines.append(f"*Score {score:+d} · {basis}*")
-            lines.append(f"<{url}>")
-            send_alert("\n".join(lines))
-            log(f"News alert sent: {verdict} {title[:60]}")
-
-            sent += 1
-            if sent >= 5:
+            is_new, item = record_news(
+                state, feed_name, title, resolved, source, result
+            )
+            state["seen_titles"].append(key)
+            if is_new:
+                new_count += 1
+                send_critical_once(state, item)
+                processed += 1
+                log(f"News recorded: {item['verdict']} {title[:90]}")
+            if processed >= MAX_ALERTS_PER_SCAN:
                 break
 
+    state["seen_titles"] = state["seen_titles"][-500:]
+    prune_state(state)
+    return new_count
 
-# ---------- main loop ----------
+
+# ---------------------------------------------------------------------------
+# EDITABLE NEWS DASHBOARD
+# ---------------------------------------------------------------------------
+
+def build_news_payload(state):
+    items = sorted(
+        state["news_history"],
+        key=lambda item: float(item.get("ts", 0)),
+        reverse=True,
+    )
+    positive = sum(1 for item in items if item["verdict"].startswith("🟢"))
+    negative = sum(1 for item in items if item["verdict"].startswith("🔴"))
+    ripple = sum(1 for item in items if item["verdict"].startswith("🟡"))
+    regulatory = sum(1 for item in items if item["verdict"].startswith("🔵"))
+    mixed = sum(1 for item in items if item["verdict"].startswith("🟠"))
+
+    if positive >= 2 and negative == 0:
+        overall = "🟢 POSITIVE NEWS MOMENTUM"
+        color = 5763719
+        summary = "At least two independent positive stories; no negative stories in the window."
+    elif negative >= 1 and positive >= 1:
+        overall = "🟠 MIXED CONDITIONS"
+        color = 15105570
+        summary = "Positive and negative developments are both present."
+    elif negative >= 1:
+        overall = "🔴 NEGATIVE NEWS PRESSURE"
+        color = 15548997
+        summary = "Negative developments detected in the rolling news window."
+    elif positive >= 2:
+        overall = "🟢 POSITIVE NEWS MOMENTUM"
+        color = 5763719
+        summary = "Multiple independent positive developments detected."
+    else:
+        overall = "🟡 NO STRONG CONFIRMATION"
+        color = 16776960
+        summary = "Not enough independent evidence for a strong directional conclusion."
+
+    lines = []
+    for item in items[:MAX_DISPLAY_NEWS]:
+        stamp = datetime.fromtimestamp(
+            float(item["ts"]), timezone.utc
+        ).strftime("%d %b %H:%M UTC")
+        source = item.get("source", "Unknown source")
+        title = item.get("title", "Untitled")
+        lines.append(
+            f"{item['verdict']} **{title[:180]}**\n"
+            f"`{source[:70]} · {stamp} · {item['confidence']} confidence`"
+        )
+
+    latest_text = "\n\n".join(lines) if lines else "No qualifying XRP/Ripple news recorded yet."
+    if len(latest_text) > 3900:
+        latest_text = latest_text[:3850] + "\n…"
+
+    embed = {
+        "title": "📰 XRP News Intelligence",
+        "description": (
+            f"**{overall}**\n{summary}\n\n"
+            f"**Rolling {NEWS_HISTORY_HOURS}-hour independent story count**"
+        ),
+        "color": color,
+        "fields": [
+            {
+                "name": "🟢 Positive",
+                "value": str(positive),
+                "inline": True,
+            },
+            {
+                "name": "🔴 Negative",
+                "value": str(negative),
+                "inline": True,
+            },
+            {
+                "name": "🟡 Ripple growth",
+                "value": str(ripple),
+                "inline": True,
+            },
+            {
+                "name": "🔵 Regulatory",
+                "value": str(regulatory),
+                "inline": True,
+            },
+            {
+                "name": "🟠 Mixed / neutral",
+                "value": str(mixed),
+                "inline": True,
+            },
+            {
+                "name": "📚 Latest developments",
+                "value": latest_text[:4000],
+                "inline": False,
+            },
+        ],
+        "footer": {
+            "text": (
+                f"Updated {utc_now().strftime('%H:%M:%S UTC')} · "
+                f"Stories expire after {NEWS_HISTORY_HOURS}h · "
+                "News sentiment is not a buy/sell signal"
+            )
+        },
+        "timestamp": iso_now(),
+    }
+    return {
+        "username": "XRP News Intelligence",
+        "embeds": [embed],
+        "allowed_mentions": {"parse": []},
+    }
+
+
+def update_news_dashboard(state, force=False):
+    payload = build_news_payload(state)
+    signature = json.dumps(payload["embeds"], sort_keys=True, ensure_ascii=False)
+    if not force and signature == state.get("last_news_render"):
+        return
+
+    try:
+        state["news_message_id"] = create_or_edit_webhook_message(
+            state.get("news_message_id"), payload
+        )
+        state["last_news_render"] = signature
+        save_state(state)
+    except Exception as exc:
+        log(f"News dashboard update failed: {exc}")
+
+
+def update_price_dashboard(payload, message_id):
+    try:
+        return create_or_edit_webhook_message(message_id, payload)
+    except Exception as exc:
+        log(f"Price dashboard update failed: {exc}")
+        return message_id
+
+
+# ---------------------------------------------------------------------------
+# MAIN LOOP
+# ---------------------------------------------------------------------------
+
 def main():
     if not WEBHOOK:
-        log("ERROR: no webhook found. Set the DISCORD_WEBHOOK_URL secret or paste it into HARDCODED_WEBHOOK.")
+        log("ERROR: set DISCORD_WEBHOOK_URL in GitHub repository secrets.")
         sys.exit(1)
 
-    log(f"Webhook found (length {len(WEBHOOK)}).")
-    if CMC_KEY:
-        log(f"CoinMarketCap key found. Polling every {CMC_EVERY_MINUTES} min.")
-    else:
-        log("No CMC_API_KEY found, using CoinLore backup prices only.")
-    log("Starting ticker loop...")
+    state = load_state()
+    prune_state(state)
+    save_state(state)
 
-    state = {"next_cmc": 0, "cmc": None}
-    message_id = None
-    history = deque()            # (timestamp, price_usd) for the 1-hour move alert
-    prev_state = None
+    log("XRP monitor starting.")
+    log(f"Price source: {'CoinMarketCap with CoinLore backup' if CMC_KEY else 'CoinLore backup only'}")
+    log(f"News history: {NEWS_HISTORY_HOURS} hours; news dashboard edits one Discord message.")
+    log(f"Webhook configured; state file: {STATE_FILE}")
+
+    price_state = {"next_cmc": 0, "cmc": None}
+    price_message_id = None
+    price_history = deque()
+    previous_level_state = None
     last_move_alert = 0
-    seen_links = {n: set() for n in NEWS_FEEDS}
-    seen_titles = set()
-    initialized = {n: False for n in NEWS_FEEDS}
+    last_news_check = 0
 
-    for i in range(210):  # about 3.5 hours
-        d, fresh = get_prices(state)
-        if d:
-            price_zar = d["price_zar"]
-            price_usd = d["price_usd"]
+    # Post an initial news dashboard or recover/edit the previous one.
+    update_news_dashboard(state, force=True)
 
-            payload = build_payload(d)
-            try:
-                if message_id is None:
-                    res = requests.post(f"{WEBHOOK}?wait=true", json=payload, timeout=10)
-                    if res.status_code in (200, 201):
-                        message_id = res.json().get("id")
-                        log(f"Posted message {message_id}")
-                    else:
-                        log("Discord post failed:", res.status_code, res.text)
-                        if res.status_code in (401, 404):
-                            sys.exit(1)
-                else:
-                    res = requests.patch(f"{WEBHOOK}/messages/{message_id}", json=payload, timeout=10)
-                    if res.status_code not in (200, 204):
-                        log("Discord edit failed:", res.status_code, res.text)
-                        message_id = None
-                    elif i % 30 == 0:
-                        log(f"Updated OK (cycle {i}) R{price_zar:.2f} via {d['source']}")
-            except Exception as e:
-                log(f"Discord error: {e}")
+    for cycle in range(RUN_MINUTES):
+        now = time.time()
+        data, fresh = get_prices(state, price_state)
 
-            reached = price_zar <= BUY_LEVEL_ZAR if ALERT_DIRECTION == "below" else price_zar >= BUY_LEVEL_ZAR
-            if prev_state is False and reached:
+        if data:
+            price = data["price_zar"]
+            price_usd = data["price_usd"]
+            price_message_id = update_price_dashboard(
+                build_price_payload(data), price_message_id
+            )
+
+            reached = (
+                price <= BUY_LEVEL_ZAR
+                if ALERT_DIRECTION == "below"
+                else price >= BUY_LEVEL_ZAR
+            )
+            if previous_level_state is False and reached:
                 send_alert(
-                    f"🚨 **XRP hit your level!** R {price_zar:,.2f} (${price_usd:,.4f}) "
-                    f"is {ALERT_DIRECTION} R {BUY_LEVEL_ZAR:.2f}. Source: {d['source']}. "
-                    f"Check your checklist before buying on Luno."
+                    f"🚨 **XRP reached your configured level!** "
+                    f"R {price:,.2f} (${price_usd:,.4f}) is "
+                    f"{ALERT_DIRECTION} R {BUY_LEVEL_ZAR:.2f}. "
+                    f"Source: {data['source']}. Review your risk plan."
                 )
-            prev_state = reached
+            previous_level_state = reached
 
             if fresh:
-                now = time.time()
-                history.append((now, price_usd))
-                while history and now - history[0][0] > 3900:
-                    history.popleft()
-                if PCT_MOVE_ALERT > 0 and history and now - history[0][0] >= 3300:
-                    change = (price_usd - history[0][1]) / history[0][1] * 100
+                price_history.append((now, price_usd))
+                while price_history and now - price_history[0][0] > 3900:
+                    price_history.popleft()
+                if (
+                    PCT_MOVE_ALERT > 0
+                    and price_history
+                    and now - price_history[0][0] >= 3300
+                ):
+                    change = (
+                        (price_usd - price_history[0][1])
+                        / price_history[0][1] * 100
+                    )
                     if abs(change) >= PCT_MOVE_ALERT and now - last_move_alert > 3600:
                         arrow = "📈" if change > 0 else "📉"
-                        send_alert(f"{arrow} XRP moved {change:+.1f}% in the last hour: R {price_zar:,.2f} (${price_usd:,.4f})")
+                        send_alert(
+                            f"{arrow} XRP moved {change:+.1f}% in roughly one hour: "
+                            f"R {price:,.2f} (${price_usd:,.4f})"
+                        )
                         last_move_alert = now
 
-        if i % NEWS_CHECK_EVERY == 0:
-            check_news(seen_links, seen_titles, initialized)
+        if now - last_news_check >= NEWS_CHECK_EVERY * 60 or cycle == 0:
+            log("Checking XRP/Ripple news feeds...")
+            new_items = process_news(state)
+            update_news_dashboard(state, force=(new_items > 0))
+            last_news_check = now
+            save_state(state)
 
+        if cycle % 10 == 0:
+            save_state(state)
         time.sleep(60)
+
+    save_state(state)
+    log("XRP monitor run completed; state saved.")
 
 
 if __name__ == "__main__":
